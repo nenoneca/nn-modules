@@ -1,0 +1,437 @@
+{
+ "version": 1,
+ "IMX708": {
+  "adn": {
+   "bf": [
+    {
+     "gain": 1,
+     "param": {
+      "level": 3,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       4,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    },
+    {
+     "gain": 3,
+     "param": {
+      "level": 5,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       4,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    },
+    {
+     "gain": 6,
+     "param": {
+      "level": 10,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       4,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    },
+    {
+     "gain": 10,
+     "param": {
+      "level": 16,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       4,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    },
+    {
+     "gain": 16,
+     "param": {
+      "level": 20,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       4,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    }
+   ]
+  },
+  "aen": {
+   "gamma": {
+    "use_gamma_param": true,
+    "luma_env": "ae.luma.avg",
+    "luma_min_step": 24.0,
+    "table": [
+     {
+      "luma": 35.0,
+      "gamma_param": 0.6
+     },
+     {
+      "luma": 55.0,
+      "gamma_param": 0.68
+     },
+     {
+      "luma": 75.0,
+      "gamma_param": 0.76
+     },
+     {
+      "luma": 90.0,
+      "gamma_param": 0.7
+     }
+    ]
+   },
+   "sharpen": [
+    {
+     "gain": 1,
+     "param": {
+      "h_thresh": 60,
+      "l_thresh": 12,
+      "h_coeff": 0.4,
+      "m_coeff": 0.6,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       2,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    },
+    {
+     "gain": 6,
+     "param": {
+      "h_thresh": 60,
+      "l_thresh": 16,
+      "h_coeff": 0.2,
+      "m_coeff": 0.3,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       2,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    },
+    {
+     "gain": 10,
+     "param": {
+      "h_thresh": 60,
+      "l_thresh": 24,
+      "h_coeff": 0.08,
+      "m_coeff": 0.15,
+      "matrix": [
+       1,
+       2,
+       1,
+       2,
+       2,
+       2,
+       1,
+       2,
+       1
+      ]
+     }
+    }
+   ],
+   "contrast": [
+    {
+     "gain": 1,
+     "value": 130
+    }
+   ]
+  },
+  "agc": {
+   "exposure": {
+    "frame_delay": 4,
+    "adjust_delay": 2
+   },
+   "gain": {
+    "min_step": 0.01,
+    "frame_delay": 3
+   },
+   "anti_flicker": {
+    "mode": "part",
+    "ac_freq": 60
+   },
+   "f_n0": 0.3,
+   "f_m0": 0.38,
+   "luma_adjust": {
+    "target_low": 52,
+    "target_high": 60,
+    "target": 56,
+    "low_threshold": 20,
+    "low_regions": 4,
+    "high_threshold": 210,
+    "high_regions": 3,
+    "weight": [
+     1,
+     1,
+     1,
+     1,
+     1,
+     1,
+     2,
+     3,
+     2,
+     1,
+     1,
+     3,
+     5,
+     3,
+     1,
+     1,
+     2,
+     3,
+     2,
+     1,
+     1,
+     1,
+     1,
+     1,
+     1
+    ]
+   },
+   "mode": "low_light_priority",
+   "high_light_priority": {
+    "low_threshold": 120,
+    "high_threshold": 230,
+    "weight_offset": 6,
+    "luma_offset": -8
+   },
+   "low_light_priority": {
+    "low_threshold": 48,
+    "high_threshold": 70,
+    "weight_offset": 6,
+    "luma_offset": 3
+   },
+   "light_threshold_priority": [
+    {
+     "luma_threshold": 25,
+     "weight_offset": 1
+    },
+    {
+     "luma_threshold": 60,
+     "weight_offset": 2
+    },
+    {
+     "luma_threshold": 95,
+     "weight_offset": 3
+    },
+    {
+     "luma_threshold": 145,
+     "weight_offset": 4
+    },
+    {
+     "luma_threshold": 220,
+     "weight_offset": 5
+    }
+   ]
+  },
+  "ian": {
+   "luma": {
+    "ae": {
+     "weight": [
+      1,
+      1,
+      2,
+      1,
+      1,
+      1,
+      2,
+      3,
+      2,
+      1,
+      2,
+      3,
+      5,
+      3,
+      2,
+      1,
+      2,
+      3,
+      2,
+      1,
+      1,
+      1,
+      2,
+      1,
+      1
+     ]
+    }
+   }
+  },
+  "acc": {
+   "saturation": [
+    {
+     "color_temp": 0,
+     "value": 125
+    }
+   ],
+   "ccm": {
+    "low_luma": {
+     "luma_env": "ae.luma.avg",
+     "threshold": 40,
+     "matrix": [
+      1.02,
+      -0.05,
+      0.03,
+      -0.04,
+      1.02,
+      -0.04,
+      0.0089,
+      -0.1424,
+      1.0235
+     ]
+    },
+    "table": [
+     {
+      "color_temp": 2856,
+      "matrix": [
+       1.36,
+       -0.26,
+       -0.08,
+       -0.17,
+       1.3,
+       -0.13,
+       0.0,
+       -0.4806,
+       1.3795
+      ]
+     },
+     {
+      "color_temp": 3200,
+      "matrix": [
+       1.28,
+       -0.22,
+       -0.06,
+       -0.14,
+       1.27,
+       -0.13,
+       0.0,
+       -0.4361,
+       1.335
+      ]
+     },
+     {
+      "color_temp": 4000,
+      "matrix": [
+       1.16,
+       -0.16,
+       -0.01,
+       -0.11,
+       1.21,
+       -0.11,
+       0.0,
+       -0.3471,
+       1.2371
+      ]
+     },
+     {
+      "color_temp": 5000,
+      "matrix": [
+       1.04,
+       -0.08,
+       0.04,
+       -0.07,
+       1.15,
+       -0.08,
+       0.0,
+       -0.2581,
+       1.1303
+      ]
+     },
+     {
+      "color_temp": 6500,
+      "matrix": [
+       0.99,
+       -0.02,
+       0.03,
+       -0.04,
+       1.08,
+       -0.05,
+       0.0,
+       -0.1424,
+       1.0324
+      ]
+     }
+    ]
+   }
+  },
+  "af": {
+   "model": 0,
+   "windows": [
+    {
+     "left": 256,
+     "top": 160,
+     "width": 768,
+     "height": 400
+    },
+    {
+     "left": 416,
+     "top": 236,
+     "width": 448,
+     "height": 248
+    },
+    {
+     "left": 512,
+     "top": 280,
+     "width": 256,
+     "height": 160
+    }
+   ],
+   "edge_thresh": 48,
+   "definition_high_threshold_ratio": 1.3,
+   "definition_low_threshold_ratio": 0.85,
+   "luminance_high_threshold_ratio": 1.15,
+   "luminance_low_threshold_ratio": 0.85,
+   "l1_scan_points_num": 8,
+   "l2_scan_points_num": 4,
+   "max_pos": 750,
+   "min_pos": 150,
+   "max_change_time": 6000000
+  }
+ }
+}

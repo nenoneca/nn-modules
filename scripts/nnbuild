@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# nnbuild — run builds/tests inside the nn-build container.
+#
+#   nnbuild host-tests          # this repo's host-side suites
+#   nnbuild shell               # interactive shell, repo mounted at /work
+#   nnbuild byai-image [-- cmd] # BeagleY card image (Buildroot) in nn-build:byai-image
+#   nnbuild <any command...>    # run it in the container at /work
+#   nnbuild --git <...>         # + host SSH agent (keys never enter the
+#                               #   container fs) for git-reaching builds
+#
+# The current directory is the repo that gets mounted.  Toolchains come
+# from the image; credentials never do (see docker/Dockerfile header).
+set -euo pipefail
+
+IMAGE="${NN_BUILD_IMAGE:-nn-build:host-ci}"
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "nnbuild: building $IMAGE (first run)…" >&2
+    docker build -t "$IMAGE" --target "${IMAGE##*:}" "$SELF_DIR/../docker"
+fi
+
+RUNARGS=(--rm --user "$(id -u):$(id -g)" -e HOME=/tmp/home
+         -v "$PWD":/work -w /work)
+
+if [ "${1:-}" = "--git" ]; then
+    shift
+    : "${SSH_AUTH_SOCK:?nnbuild --git needs a running ssh-agent (ssh-add -l)}"
+    RUNARGS+=(-v "$SSH_AUTH_SOCK":/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent)
+    [ -f "$HOME/.gitconfig" ] && RUNARGS+=(-v "$HOME/.gitconfig":/etc/gitconfig:ro)
+fi
+
+case "${1:-shell}" in
+shell)
+    exec docker run -it "${RUNARGS[@]}" "$IMAGE" bash
+    ;;
+host-tests)
+    # Detect which repo we're standing in and run its host-side suites.
+    exec docker run "${RUNARGS[@]}" "$IMAGE" bash -ec '
+        mkdir -p "$HOME"
+        ran=0
+        if [ -x modules/tests/run_host_tests.sh ]; then
+            modules/tests/run_host_tests.sh; ran=1
+        fi
+        if [ -f pyproject.toml ] && [ -d tests ]; then
+            python3 -m pytest tests/ -q; ran=1
+            if ls hub/static/*.js >/dev/null 2>&1; then
+                node --check hub/static/applib.js
+                node --check hub/static/app.js
+                node --test tests/
+            fi
+        fi
+        if [ -f tests/test_lpwd_policy_host.c ]; then
+            gcc -std=c11 -Wall -Wextra -O0 -g -I main \
+                tests/test_lpwd_policy_host.c -o /tmp/lpwd_test
+            /tmp/lpwd_test; ran=1
+        fi
+        [ "$ran" = 1 ] || { echo "nnbuild: no host suites found here" >&2; exit 2; }'
+    ;;
+sensor)
+    # Zephyr sensor build: cwd = the device/ tree.  Mounted at its REAL
+    # path (not /work) so cmake caches and any embedded paths match the
+    # native build byte-for-byte; west workspace read-only beside it.
+    APP="${2:?usage: nnbuild sensor <app-name>}"
+    ZWS="${NN_ZEPHYR_WS:-/media/chalos/mx500/oss/zephyr}"
+    IMAGE="${NN_BUILD_IMAGE:-nn-build:zephyr}"
+    # NN_APP_VERSION (e.g. 0.0.53) is the firmware version; without it the
+    # build derives one from git, which the non-git device/ tree cannot
+    # give -> 0.0.0-nogit (every Jenkins sensor build until 2026-09-25).
+    exec docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+        ${NN_APP_VERSION:+-e NN_APP_VERSION="$NN_APP_VERSION"} \
+        ${NN_SNIPPET:+-e NN_SNIPPET="$NN_SNIPPET"} \
+        -v "$PWD":"$PWD" -w "$PWD" \
+        -v "$ZWS":"$ZWS":ro \
+        -e ZEPHYR_BASE="$ZWS/zephyr" \
+        -e PYTHON_EXECUTABLE=/opt/venv312/bin/python \
+        -e PYTHONDONTWRITEBYTECODE=1 \
+        "$IMAGE" bash -ec '
+        mkdir -p "$HOME"
+        export PATH=/opt/venv312/bin:$PATH   # esptool must be ON PATH
+        # Mirror the host toolchain resolution (fleet lineage = gcc 12):
+        # registry points at 0.17.0; 1.0.1 in HOME satisfies the >=1.0
+        # version check exactly as it does on the dev host.
+        mkdir -p "$HOME/.cmake/packages/Zephyr-sdk"
+        echo /opt/zephyr-sdk-1.0.1/cmake > "$HOME/.cmake/packages/Zephyr-sdk/r101"
+        export ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk-0.17.0
+        ln -sfn /opt/zephyr-sdk-0.17.0 "$HOME/zephyr-sdk-0.17.0"
+        ln -sfn /opt/zephyr-sdk-1.0.1 "$HOME/zephyr-sdk-1.0.1"
+        # NN_SNIPPET: a Zephyr snippet, e.g. spinel-usb for the NCP that the
+        # gateways drive over USB-JTAG (without it Spinel sits on UART1 and
+        # no gateway finds the NCP -- Jenkins #18, 2026-09-26).
+        scripts/build.sh --app "apps/"'"$APP"' \
+            --build-dir "out-docker/"'"$APP"' \
+            ${NN_SNIPPET:+--snippet "$NN_SNIPPET"} \
+            --board esp32c6_devkitc/esp32c6/hpcore'
+    ;;
+gateway)
+    # gw_linux: NATIVE arm64 build (qemu) in nn-build:gateway — Debian's
+    # arm64 libmbedtls/libsystemd satisfy the deps the cross sysroot lacks.
+    # cwd = an nn-modules checkout (host/gw_linux + modules/libs).
+    IMAGE="${NN_BUILD_IMAGE:-nn-build:gateway}"
+    # cwd mounted at its REAL path: gw_linux's CMake references sibling
+    # trees (fw_common, nn_proto) by path, which must resolve identically
+    # inside the container.
+    # Canonical path: the tree is reachable via an alias (~/ext/mx500) too,
+    # and a CMakeCache made under one path refuses the other.  Clean build
+    # dir each run — gw_linux is small; determinism beats incremental here.
+    cd "$(pwd -P)"
+    exec docker run --rm --platform linux/arm64 --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp/home -v "$PWD":"$PWD" -w "$PWD" "$IMAGE" bash -ec '
+        mkdir -p "$HOME"; rm -rf build-docker/gw_linux
+        # static mbedTLS 3.6 baked into the image (bookworm hosts)
+        if [ -f /opt/mbedtls/lib/libmbedcrypto.a ]; then
+            MB="-DMBEDTLS_INCLUDE_DIR=/opt/mbedtls/include -DMBEDCRYPTO_LIB=/opt/mbedtls/lib/libmbedcrypto.a"
+        else MB=""; fi
+        cmake -S host/gw_linux -B build-docker/gw_linux $MB
+        cmake --build build-docker/gw_linux -j"$(nproc)"
+        file build-docker/gw_linux/gw_linux | cut -c1-80'
+    ;;
+byai)
+    # BeagleY-AI camera app: built INSIDE the imported edgeai LXC rootfs
+    # (nn-build:byai, Arago 2025.01 arm64 — the ABI the binary runs on).
+    # cwd = the nn-app-camera-beagleyai-imx708 checkout (with nn-modules
+    # submodule).  ORT header path is baked into its CMakeLists.
+    IMAGE="${NN_BUILD_IMAGE:-nn-build:byai}"
+    # Arago has libmbedcrypto.so but NO psa/ headers; the board injects
+    # Debian's headers (-I/opt/nn/cam/psa-hdrs) and links Arago's lib.
+    # Same here via the repo's NN_EXTRA_PREFIX hook (headers-only prefix).
+    PFX="${NN_BYAI_PSA_PREFIX:-/media/chalos/mx500/nn-jenkins/prefix/mbedtls-dev-arm64}"
+    exec docker run --rm --platform linux/arm64 --user "$(id -u):$(id -g)" \
+        -e HOME=/tmp/home -v "$PWD":/work -w /work -v "$PFX":"$PFX":ro \
+        -e NN_EXTRA_PREFIX="$PFX" "$IMAGE" bash -ec '
+        mkdir -p "$HOME"
+        cmake -S . -B build-docker -DNN_INFER_PAL=byai_ort -DNN_EXTRA_PREFIX="$NN_EXTRA_PREFIX" ${NN_BYAI_CMAKE_ARGS:-}
+        cmake --build build-docker -j"$(nproc)"
+        ls -la build-docker/nn-camera'   # Arago image has no `file`
+    ;;
+byai-image)
+    # BeagleY-AI factory card image: cwd = the app repo checkout; runs
+    # `packaging/build-image.sh` (or the command after `--`) inside
+    # nn-build:byai-image.  Buildroot's download cache persists on the
+    # host (NN_BR_DL, default nn-jenkins/br-dl) and is mounted at /work/dl
+    # so a rebuild does not refetch the toolchain sources; the vendor
+    # firmware dir (NN_FW_DIR, from nn-fetch-vendor) is mounted read-only
+    # at the same path so the script's refusal-without-blobs still applies.
+    shift
+    IMAGE="${NN_BUILD_IMAGE:-nn-build:byai-image}"
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        echo "nnbuild: building $IMAGE (first run)…" >&2
+        docker build -t "$IMAGE" --target byai-image "$SELF_DIR/../docker"
+    fi
+    # two caches survive between runs: Buildroot's dl/ (toolchain sources)
+    # and the BR2_EXTERNAL dl/ (the exported ~1.5 GB kernel tarball)
+    DL="${NN_BR_DL:-/media/chalos/mx500/nn-jenkins/br-dl}"; mkdir -p "$DL/buildroot" "$DL/br2-external"
+    RUNARGS+=(-v "$DL/buildroot":/work/dl -e BR2_DL_DIR=/work/dl
+              -v "$DL/br2-external":/work/packaging/br2-external/dl)
+    # compiler cache at Buildroot's default BR2_CCACHE_DIR ($HOME/.buildroot-ccache,
+    # HOME=/tmp/home here): inert until the defconfig sets BR2_CCACHE=y, then it
+    # takes the toolchain+package rebuild (~90 min on a warm dl cache) out of every run
+    mkdir -p "$DL/ccache"; RUNARGS+=(-v "$DL/ccache":/tmp/home/.buildroot-ccache)
+    # an agent without outbound git can point the kernel fetch at a local mirror
+    [ -n "${NN_KERNEL_MIRROR:-}" ] && RUNARGS+=(-v "$NN_KERNEL_MIRROR":"$NN_KERNEL_MIRROR":ro -e NN_KERNEL_MIRROR="$NN_KERNEL_MIRROR")
+    [ -n "${NN_FW_DIR:-}" ] && RUNARGS+=(-v "$NN_FW_DIR":"$NN_FW_DIR":ro -e NN_FW_DIR="$NN_FW_DIR")
+    # TI vision-apps RTOS firmware for the camera path (R5F + 2x C7x), same
+    # treatment as the cc33xx blobs: fetched and verified outside, read-only in
+    [ -n "${NN_TI_FW_DIR:-}" ] && RUNARGS+=(-v "$NN_TI_FW_DIR":"$NN_TI_FW_DIR":ro -e NN_TI_FW_DIR="$NN_TI_FW_DIR")
+    # the prebuilt cross toolchain (nn-fetch-vendor nn-byai-toolchain-<key>),
+    # read-only at the same path, like the vendor firmware
+    [ -n "${NN_TOOLCHAIN_DIR:-}" ] && RUNARGS+=(-v "$NN_TOOLCHAIN_DIR":"$NN_TOOLCHAIN_DIR":ro -e NN_TOOLCHAIN_DIR="$NN_TOOLCHAIN_DIR")
+    # the toolchain key includes the builder image: the SDK's host gcc/as/ld
+    # link against this image's libc, so a toolchain from another image is a
+    # different toolchain
+    RUNARGS+=(-e NN_BUILD_IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$IMAGE")")
+    [ "${1:-}" = "--" ] && shift
+    [ $# -gt 0 ] || set -- packaging/build-image.sh
+    exec docker run "${RUNARGS[@]}" "$IMAGE" bash -ec 'mkdir -p "$HOME"; exec "$@"' -- "$@"
+    ;;
+camera)
+    # ESP-IDF camera build: cwd = the app repo.  The vendored IDF tree
+    # mounts read-only at its real path (same path install.sh saw at
+    # image build); output goes to build-docker/ so a native build/ can
+    # sit beside it for parity comparison.
+    IDF="${NN_IDF_PATH:-/media/chalos/mx500/nn_project_nowest/media/esp-idf-v6.0.1}"
+    IMAGE="${NN_BUILD_IMAGE:-nn-build:espidf}"
+    exec docker run "${RUNARGS[@]}" \
+        -v "$IDF":"$IDF":ro -e IDF_PATH="$IDF" \
+        -e IDF_TARGET="${NN_IDF_TARGET:-esp32p4}" \
+        "$IMAGE" bash -ec '
+        mkdir -p "$HOME"
+        . "$IDF_PATH/export.sh" >/dev/null 2>&1
+        idf.py -B build-docker build'
+    ;;
+*)
+    exec docker run "${RUNARGS[@]}" "$IMAGE" bash -ec 'mkdir -p "$HOME"; exec "$@"' -- "$@"
+    ;;
+esac

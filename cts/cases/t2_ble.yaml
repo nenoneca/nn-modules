@@ -1,0 +1,275 @@
+# T2 · BLE peripheral cases for the nn HAL compatibility suite.
+#
+# Record shape is the suite's ("One case, one record"): id, contract, level,
+# peers, setup, stimulus, pass, evidence, seen.
+#
+# Scope of this file: the cases that came out of the posix/BlueZ backend work
+# in September 2026.  The register/advertise, read/notify and advertising-off
+# cases are already on the plan page and are not duplicated here.
+#
+# NUMBERING: T2-BLE-07 is the id the suite assigned.  T2-BLE-10, T2-BLE-11,
+# T2-BLE-12 and T0-BLE-01 were added here; the plan page now cites them and
+# points at this directory as the source of truth, so renumbering is a
+# two-file edit.
+#
+# A note on what these test.  Every case below is black-box: it drives the
+# public nn_pal surface and observes from the bench peer.  None of them assert
+# anything about sd-bus, BlueZ or D-Bus, because a new platform will have
+# neither -- what carries over is the *behaviour* a caller is entitled to, and
+# each case exists because a real backend failed to provide it.
+
+cases:
+
+  - id:       T2-BLE-07
+    contract: |
+      nn_pal/ble.h — "advertising resumes after a central disconnects"
+    level:    must
+    peers:    reference central (hub scan)
+    setup:    service registered, advertising, central connected
+    stimulus: central disconnects
+    pass:     advert visible to the central again within 2 s, no process restart
+    evidence: btmon capture from the peer; the backend's own log; timestamps
+    seen: |
+      BlueZ backend before 3a46718: nothing watched org.bluez.Device1
+      Connected, so the advert was dropped on connect and never re-registered.
+      An aborted provisioning wizard left the camera invisible until the
+      process was restarted, which on a deployed board means a site visit.
+
+  - id:       T2-BLE-10
+    contract: |
+      nn_pal/ble.h — nn_pal_ble_gatt_register_service(): "The host stack may
+      interrogate this application BEFORE the call can complete [...] a
+      backend must therefore keep servicing the host stack while its own
+      registration request is outstanding."
+      Returns 0 on success; after registration chrcs[i].handle is filled in.
+    level:    must
+    peers:    reference central (hub scan)
+    setup: |
+      A platform whose host stack interrogates the application during
+      registration.  No special setup on the device beyond a normal start.
+    stimulus: |
+      Call nn_pal_ble_gatt_register_service() for the six-characteristic
+      provisioning service, then advertise, from a cold start.
+    pass: |
+      register returns 0 within 5 s, every chrcs[i].handle is non-zero, and
+      the reference central sees the advert and can discover all six
+      characteristics.  A register that returns 0 but leaves the service
+      undiscoverable is a fail, and so is one that never returns.
+    evidence: |
+      the call's return and elapsed time; the handle array; the central's
+      discovery result; the backend log at debug.
+    seen: |
+      BlueZ backend before a84fc16, and the same mistake twice.  BlueZ calls
+      ObjectManager.GetManagedObjects() back into the application BEFORE
+      replying to RegisterApplication, and a synchronous call cannot dispatch
+      an inbound method call while it waits for its own reply -- so
+      registration never completed.  The reason this is worth a case rather
+      than a note is that the symptom was NOT the hang you would predict: a
+      second fault (a concurrent bus thread, see T2-BLE-11) turned it into
+      "-EBADMSG / Bad message", which sent diagnosis toward malformed
+      property signatures for a day.  A black-box case catches both shapes.
+
+  - id:       T2-BLE-11
+    contract: |
+      nn_pal/ble.h — "All callbacks fire from a single backend-managed task;
+      callers don't have to worry about the BT host's threading model."
+    level:    must
+    peers:    reference central (hub scan)
+    setup:    service registered, advertising, central connected and subscribed to STATUS
+    stimulus: |
+      From a second application thread, call nn_pal_ble_notify() in a loop
+      (10 Hz, 5 s) while the central performs a write to CONFIG and a read of
+      DEVICE_PUBKEY.  The point is concurrent PAL use from a caller thread
+      while the backend is servicing the host stack.
+    pass: |
+      every write is acknowledged within 1 s, the read returns the correct
+      32 bytes, notifications continue to arrive, and no call returns a
+      transport-level error.  The contract sentence promises the caller does
+      not have to think about the host's threading model; a backend that
+      requires callers to serialise for it fails this case.
+    evidence: |
+      peer-side timeline of writes, reads and notifications with timestamps;
+      any non-zero return from the notify loop.
+    seen: |
+      BlueZ backend before a84fc16 and 3a46718, in two distinct ways.  First,
+      an sd_bus is not thread-safe and the backend touched it from both the
+      bus thread and caller threads, which corrupted message state and
+      surfaced as -EBADMSG during registration rather than as a clean fault.
+      Then the fix itself -- one mutex around every bus touch -- deadlocked
+      against itself: the bus thread held the lock across dispatch, a
+      dispatched WriteValue called set_status(), and that took the same
+      non-recursive mutex.  The write got no reply and the central timed out
+      at exactly 5.0 s.  Both are invisible to a single-threaded test, which
+      is why this case drives a second thread on purpose.
+
+  - id:       T0-BLE-01
+    contract: |
+      nn_pal/ble.h — nn_pal_ble_uuid_from_str(): the 128-bit byte order the
+      backend presents to the host stack must match the text form the peer
+      expects.
+      NUMBERING: provisional; T0 ids are not published yet.
+    level:    must
+    peers:    none (host contract test)
+    setup:    host build of the backend's uuid helpers
+    stimulus: |
+      Round-trip each of the six e7f000xx provisioning UUIDs through
+      nn_pal_ble_uuid_from_str() and the backend's uuid_to_str(), and assert
+      the first byte of the 128-bit array explicitly.
+    pass: |
+      every UUID round-trips to the identical text form, and the byte-order
+      assertion holds.  Already implemented and passing:
+      modules/libs/nn_pal/tests/test_ble_posix_host.c -- cite that file
+      rather than writing a second one.  Note it pins the endianness
+      separately from the round-trip, deliberately: a consistently reversed
+      pair of helpers round-trips perfectly and still presents a reversed
+      UUID to the central.
+    evidence: the test's own assertions
+    seen: |
+      Not a field failure, which is the point: a byte-order slip registers
+      happily, advertises happily, and is only discovered when a central
+      fails to find the service.  The related field failure was different --
+      compound-literal UUIDs whose storage died at the end of the enclosing
+      statement, leaving the service registered against freed memory.  That
+      one is a lifetime bug rather than a format bug, so it is a separate
+      record -- T2-BLE-12 -- against the storage-lifetime sentence, not this
+      one.  Keeping them apart matters: a suite that folds them together
+      would report a single BLE-UUID failure and leave whoever reads it
+      guessing which of two unrelated faults they have.
+
+  - id:       T2-BLE-12
+    contract: |
+      nn_pal/ble.h — nn_pal_ble_gatt_register_service(): "the backend RETAINS
+      THE POINTERS, so the storage must outlive the service.  A compound
+      literal does not satisfy this."
+    level:    must
+    peers:    reference central (hub scan)
+    setup: |
+      A build in which the service and characteristic tables are passed from
+      a scope that ENDS before the service is used -- the suite's fixture
+      constructs them in a helper function that returns, which is the legal
+      way to reproduce what a compound literal did accidentally.
+    stimulus: |
+      Register the service from that scope, return from it, advertise, then
+      have the central connect, discover, read DEVICE_PUBKEY and write
+      CONFIG.  Run the same sequence twice in one process so a reused stack
+      frame has a chance to overwrite the tables.
+    pass: |
+      Either the backend copies what it needs and everything works, or
+      registration fails outright with a negative return.  A backend that
+      returns 0 and then serves garbage -- or serves correctly on the first
+      pass and wrongly on the second -- fails this case.  What is NOT
+      acceptable is the observed field behaviour: register and advertise
+      succeed, and the fault appears only when a central uses the service.
+    evidence: |
+      the central's discovery result and the bytes read back, both runs;
+      the backend log; a sanitiser build of the runner where the platform
+      has one, since ASan names this immediately and a black-box read of
+      corrupted-but-plausible bytes does not.
+    seen: |
+      nn_pal BLE provisioning outage, September 2026.  The UUIDs were built
+      as compound literals, whose storage ends with the enclosing statement,
+      so the service was registered against memory that was already free.
+      Registration returned 0, the advert appeared, and the device looked
+      healthy right up to the point a central tried to provision it -- which
+      is precisely the shape that gets past a bring-up check and into the
+      field.  Fixed by giving them static const storage.
+
+  - id:       T2-BLE-13
+    contract: |
+      On a freshly flashed image, the BLE controller the platform declares is
+      present and able to advertise within 60 s of boot, with no manual step.
+    level:    must
+    peers:    reference central (hub scan)
+    setup:    a clean card, first boot, nothing provisioned
+    stimulus: power on and wait
+    pass: |
+      A controller is registered with the host stack and the provisioning
+      advert is visible to the reference central within 60 s.  If the platform
+      needs a bring-up step (firmware switch, GPIO, debugfs knob), the IMAGE
+      performs it: a controller that only appears after someone runs a command
+      is a FAIL, because a fresh card has no other way onto the network.
+    evidence: boot console with timestamps; controller list; the central's scan
+    seen: |
+      BeagleY-AI cc33xx, 2026-09-14 (E2E run 1).  The Bluetooth half of the
+      combo chip only comes up after a debugfs knob (ble_enable) is written
+      once the Wi-Fi firmware is running.  The Debian card had a vendor unit
+      that did it; the new image did not, so the transport sat at "HW_ON"
+      forever, there was no controller, and the card could never be
+      provisioned.  Found by writing the knob by hand on the board.
+
+  - id:       T2-BLE-14
+    contract: |
+      The radio is powered for setup mode only.  Once the device is
+      provisioned, the BLE controller is powered off; when provisioning is
+      cleared, it comes back on by itself.
+    level:    must
+    peers:    reference central (hub scan)
+    setup:    a device just provisioned by the wizard
+    stimulus: |
+      Finish provisioning, reboot, then clear the device (unregister) and
+      reboot again.
+    pass: |
+      After provisioning and after every later boot, the controller reports
+      powered off and nothing is advertised.  After a clear, the controller is
+      powered and advertising again without anyone touching the board.
+    evidence: controller power state at each step; the central's view
+    seen: |
+      BeagleY-AI, 2026-09-14 (E2E run 1).  The setup daemon exited "already
+      provisioned" but the controller stayed powered; the policy existed only
+      as a hand-installed drop-in on an earlier card and never reached the
+      image.
+
+  - id:       T2-BLE-15
+    contract: |
+      A central that connects, touches the provisioning service and leaves
+      without provisioning costs the device nothing: it stays discoverable,
+      and its BLE stack stays responsive, so the next attempt -- seconds
+      later -- succeeds.  (Callbacks run on the backend's own thread; nothing
+      a disconnect triggers may wait on that thread.)
+    level:    must
+    peers:    two centrals, or one central used twice (a bench host and the hub)
+    setup:    unprovisioned device in setup mode
+    stimulus: |
+      Central A connects, reads one or two provisioning characteristics and
+      disconnects.  Within 5 s, the wizard (central B) provisions the device.
+    pass: |
+      B connects and provisioning completes.  The device logs no stall and no
+      registration error around the disconnect, and it is advertising
+      throughout -- a scan in the 10 s after A leaves sees it.
+    evidence: |
+      Device log from A's connect to B's SUCCESS, with timestamps; the gap
+      between A's disconnect and B's connect.
+    seen: |
+      BeagleY-AI (posix/BlueZ backend), 2026-09-14, E2E run 2.  After a hub
+      job's link dropped 2.8 s in, the backend re-registered its advertisement
+      from the disconnect callback and waited for the reply on the bus thread
+      -- which alone could pump it -- so the whole D-Bus loop stalled 10 s
+      ("RegisterAdvertisement: timed out waiting for BlueZ"), then BlueZ
+      answered AlreadyExists: it had kept the advertisement all along.  Fix
+      878eb9c; verified with A = bench host reading two characteristics and B
+      = the hub connecting 7.1 s later and provisioning.
+
+# Header gaps found by these cases.  CLOSED -- the sentences are in
+# nn_pal/ble.h as of this branch; kept here as the record of why they exist,
+# since a later tidy-up of a comment that looks redundant would re-open both.
+# The suite is the spec's test, not a second spec, so these come first.
+header_changes:
+  - file:   modules/libs/nn_pal/include/nn_pal/ble.h
+    for:    T2-BLE-10
+    status: closed
+    added: |
+      On nn_pal_ble_gatt_register_service(): state that the backend may have to
+      answer requests from the host stack before registration completes, so
+      implementations must not block the thread that services the stack while
+      waiting for it.  Without that sentence the header is silent on the
+      single hardest part of writing this backend, and the next port will
+      make the same synchronous call.
+  - file:   modules/libs/nn_pal/include/nn_pal/ble.h
+    for:    T2-BLE-12
+    status: closed
+    added: |
+      The "storage must outlive the service" note was correct but easy to
+      read past.  It now says plainly that a compound literal does not
+      satisfy it, and why: the service ends up registered against freed
+      memory, which registers and advertises perfectly and fails only when a
+      central tries to use it.

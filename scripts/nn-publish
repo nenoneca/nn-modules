@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# nn-publish — push a build's firmware artifacts to the MinIO nn-images
+# bucket with a manifest.  Called at the end of a Jenkins firmware stage.
+#
+#   nn-publish <image-name> <artifact-dir> [file ...]
+#
+# Layout (see design note): nn-images/<image>/<pipeline>/<build>-<sha>/…
+#   <image>      product / OTA-catalog key (arg 1)
+#   <pipeline>   Jenkins job name         (JOB_NAME, or $NN_PIPELINE)
+#   <build>-<sha> build number + git short sha (BUILD_NUMBER / GIT_COMMIT)
+# plus a stable   nn-images/<image>/<pipeline>/latest/  refreshed each run.
+#
+# Creds come from the env file (host-only, never git); MinIO is reached
+# over the host network via a throwaway mc container.
+set -euo pipefail
+
+IMAGE="${1:?usage: nn-publish <image-name> <artifact-dir> [files...]}"
+DIR="${2:?artifact dir required}"
+shift 2
+FILES=("$@")
+
+ENVF="${NN_MINIO_ENV:-/media/chalos/mx500/nn-jenkins/minio.env}"
+# shellcheck disable=SC1090
+[ -f "$ENVF" ] && . "$ENVF"
+: "${NN_MINIO_ACCESS:?}" "${NN_MINIO_SECRET:?}"
+: "${NN_MINIO_ENDPOINT:=http://127.0.0.1:9000}" "${NN_MINIO_BUCKET:=nn-images}"
+
+PIPELINE="${NN_PIPELINE:-${JOB_NAME:-manual}}"
+PIPELINE="${PIPELINE//\//_}"
+BUILD="${BUILD_NUMBER:-0}"
+SHA="$(git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo nogit)"
+STAMP="${BUILD}-${SHA}"
+PREFIX="$IMAGE/$PIPELINE/$STAMP"
+
+# default file set: signed + unsigned bins if not given explicitly.  Card and
+# A/B system-slot images travel as *.img.xz / *.ext4.xz; a per-artifact
+# <artifact>.manifest.json beside them (written by the image build) carries
+# fields nn-release copies into the hub manifest (requires, kernel, git).
+if [ "${#FILES[@]}" -eq 0 ]; then
+    while IFS= read -r f; do FILES+=("$f"); done < <(
+        find "$DIR" -maxdepth 6 \( -name '*.signed.bin' -o -name '*.bin' -o -name '*.img.xz' \
+                                   -o -name '*.ext4.xz' -o -name '*.manifest.json' \) \
+             ! -path '*/CMakeFiles/*' ! -name 'CMake*' \
+             ! -name 'bootloader.bin' ! -name 'partition*.bin' \
+             ! -name 'zephyr_pre*.bin' 2>/dev/null)
+fi
+[ "${#FILES[@]}" -gt 0 ] || { echo "nn-publish: no artifacts under $DIR" >&2; exit 2; }
+
+# manifest.json (metadata + per-file sha256)
+# Staging must sit on a path identical inside this container and on the
+# host (the mc container mounts it via the shared docker socket) — the
+# nn-jenkins tree is bind-mounted at the same path in both.
+STAGE_ROOT="${NN_MINIO_STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}"
+mkdir -p "$STAGE_ROOT"
+MAN="$(mktemp -p "$STAGE_ROOT")"
+{
+    printf '{\n  "image": "%s",\n  "pipeline": "%s",\n  "build": "%s",\n  "sha": "%s",\n' \
+        "$IMAGE" "$PIPELINE" "$BUILD" "$SHA"
+    printf '  "endpoint_path": "%s/%s",\n  "files": [\n' "$NN_MINIO_BUCKET" "$PREFIX"
+    n=${#FILES[@]}; i=0
+    for f in "${FILES[@]}"; do
+        i=$((i+1)); sz=$(stat -c %s "$f"); h=$(sha256sum "$f" | cut -d' ' -f1)
+        printf '    {"name": "%s", "size": %s, "sha256": "%s"}%s\n' \
+            "$(basename "$f")" "$sz" "$h" "$([ $i -lt $n ] && echo , || true)"
+    done
+    printf '  ]\n}\n'
+} > "$MAN"
+
+STAGE="$(mktemp -d -p "$STAGE_ROOT")"
+for f in "${FILES[@]}"; do cp "$f" "$STAGE/"; done
+cp "$MAN" "$STAGE/manifest.json"
+
+docker run --rm --network host --entrypoint sh \
+    -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+    -v "$STAGE":/stage:ro minio/mc:latest -c "
+        set -e
+        mc cp --recursive /stage/ nn/$NN_MINIO_BUCKET/$PREFIX/
+        mc rm --recursive --force nn/$NN_MINIO_BUCKET/$IMAGE/$PIPELINE/latest/ 2>/dev/null || true
+        mc cp --recursive /stage/ nn/$NN_MINIO_BUCKET/$IMAGE/$PIPELINE/latest/
+    "
+rm -rf "$STAGE" "$MAN"
+echo "nn-publish: $NN_MINIO_BUCKET/$PREFIX  (${#FILES[@]} files + manifest.json)"

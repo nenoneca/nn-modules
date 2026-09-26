@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# nn-bundle-byai — assemble the BeagleY-AI camera app bundle FROM GIT,
+# reproducing tools/byai-ota/release.sh's layout without ssh-ing a board:
+#
+#   bundle.tgz = nn-camera (built) + cam_run.sh (repo template) +
+#                librproc_byname.so (compiled here) + agent.sh + manifest.json
+#
+#   nn-bundle-byai <version> <byai-checkout> <nn-hub-tools-dir> <outdir>
+#
+# Runs the arm64 compile of the rproc shim inside nn-build:byai (same
+# Arago ABI the binary runs on).  Output: <outdir>/byai_camera.tar.gz,
+# publishable via nn-publish as image 'byai_camera'.
+set -euo pipefail
+VER="${1:?version}"; SRC="${2:?byai checkout dir}"; TOOLS="${3:?nn-hub tools/byai-ota dir}"; OUT="${4:?outdir}"
+IMAGE="${NN_BUILD_IMAGE:-nn-build:byai}"
+[ -x "$SRC/build-docker/nn-camera" ] || { echo "nn-bundle-byai: build nn-camera first (nnbuild byai)" >&2; exit 2; }
+
+W="$(mktemp -d -p "${NN_MINIO_STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}")"
+cp "$SRC/build-docker/nn-camera" "$W/nn-camera"
+cp "$SRC/board/cam_run.sh"       "$W/cam_run.sh"
+cp "$TOOLS/agent.sh"             "$W/agent.sh"
+cp "$TOOLS/rproc_byname.c"       "$W/rproc_byname.c"
+
+# remoteproc-by-name LD_PRELOAD shim: compiled natively for aarch64
+docker run --rm --platform linux/arm64 --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+    -v "$W":/w -w /w "$IMAGE" bash -ec \
+    'mkdir -p "$HOME"; gcc -O2 -fPIC -shared -o librproc_byname.so rproc_byname.c -ldl -lpthread && file librproc_byname.so | cut -c1-70'
+rm -f "$W/rproc_byname.c"
+
+# Optional second shim from the app repo: IMX219->IMX708 AE gain translation
+# (board/imx708_gain_shim.c explains why).  Optional so an app that does not
+# need it, or a future one with real IMX708 ISP support, simply omits the file.
+EXTRA=""
+if [ -f "$SRC/board/imx708_gain_shim.c" ]; then
+    cp "$SRC/board/imx708_gain_shim.c" "$W/imx708_gain_shim.c"
+    docker run --rm --platform linux/arm64 --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+        -v "$W":/w -w /w "$IMAGE" bash -ec \
+        'mkdir -p "$HOME"; gcc -O2 -fPIC -shared -o libimx708_gain.so imx708_gain_shim.c -ldl'
+    rm -f "$W/imx708_gain_shim.c"; chmod +x "$W/libimx708_gain.so"
+    EXTRA="libimx708_gain.so"
+fi
+
+# The detector self-test reference frame (raw RGB888 640x360, known answer).
+# cam_run.sh only sets NN_INFER_SELFTEST when it is present, so a bundle
+# without it still runs -- but then nothing on a live camera can tell a dead
+# detector from an empty scene, so ship it.
+if [ -f "$SRC/board/selftest.gray" ]; then
+    cp "$SRC/board/selftest.gray" "$W/selftest.gray"
+    EXTRA="$EXTRA selftest.gray"
+fi
+if [ -f "$SRC/board/selftest.rgb" ]; then
+    cp "$SRC/board/selftest.rgb" "$W/selftest.rgb"
+    EXTRA="$EXTRA selftest.rgb"
+else
+    # NOT silent: it is gitignored (a TI derivative, generated not committed),
+    # so a fresh clone has none, and a bundle without it means nothing on the
+    # camera can tell a dead detector from an empty scene.  e2e-camera.py then
+    # FAILS the inference stage rather than warning, which is the point.
+    echo "nn-bundle-byai: WARNING no board/selftest.rgb -- the detector self-test" >&2
+    echo "  will be ABSENT from this bundle and edge inference will NOT be verified." >&2
+    echo "  Generate it: python3 packaging/mk-selftest-rgb.py" >&2
+fi
+
+# The IMX708 VISS tuning (packaging/mk-imx708-dcc.py).  Without it cam_run.sh
+# falls back to TI's imx219 DCC and the picture is magenta.
+if [ -f "$SRC/board/dcc_viss_imx708.bin" ]; then
+    cp "$SRC/board/dcc_viss_imx708.bin" "$W/dcc_viss_imx708.bin"
+    EXTRA="$EXTRA dcc_viss_imx708.bin"
+else
+    # Also gitignored and generated.  cam_run.sh falls back to TI's imx219
+    # tuning, which works but is strongly magenta -- so say so loudly.
+    echo "nn-bundle-byai: WARNING no board/dcc_viss_imx708.bin -- the camera will" >&2
+    echo "  fall back to TI's imx219 tuning and the picture will be MAGENTA." >&2
+    echo "  Generate it: python3 packaging/mk-imx708-dcc.py \\" >&2
+    echo "    <edgeai-rootfs>/opt/imaging/imx219/linear/dcc_viss_10b_1920x1080.bin \\" >&2
+    echo "    board/dcc_viss_imx708.bin --row-gain 0.5525,1.0,0.3605" >&2
+fi
+
+printf '{\n "device_type": "byai_camera",\n "version": "%s",\n "format": "tar.gz",\n "requires_platform": "1.0.0"\n}\n' "$VER" > "$W/manifest.json"
+chmod +x "$W/nn-camera" "$W/cam_run.sh" "$W/agent.sh" "$W/librproc_byname.so"
+mkdir -p "$OUT"
+tar -czf "$OUT/byai_camera.tar.gz" -C "$W" nn-camera cam_run.sh agent.sh manifest.json librproc_byname.so $EXTRA
+rm -rf "$W"
+echo "nn-bundle-byai: $OUT/byai_camera.tar.gz ($(stat -c %s "$OUT/byai_camera.tar.gz") B, v$VER)"

@@ -1,0 +1,70 @@
+diff --git a/drivers/ieee802154/ieee802154_esp32.c b/drivers/ieee802154/ieee802154_esp32.c
+index b40ae5a16f4..3fb8c10af5e 100644
+--- a/drivers/ieee802154/ieee802154_esp32.c
++++ b/drivers/ieee802154/ieee802154_esp32.c
+@@ -271,11 +271,26 @@ free_esp_ack:
+ }
+ 
+ /* override weak function in components/ieee802154/esp_ieee802154.c of ESP-IDF */
++/* Outcome of the last transmission, as the errno esp32_tx() returns.
++ * The upstream driver dropped `error` and returned 0, so OpenThread saw
++ * every failed frame as delivered and never retried (its default is 15
++ * direct retries): on a busy channel ~1 frame in 3 was silently lost.
++ * modules/openthread/platform/radio.c maps -ENOMSG -> NO_ACK, -EBUSY ->
++ * CHANNEL_ACCESS_FAILURE, -EIO -> ABORT; all three are retried. */
++static volatile int esp32_tx_result;
++
++/* nn diagnostics: transmit outcomes by the HAL's error code.  [0] counts
++ * successes; [1 + error] each esp_ieee802154_tx_error_t.  NB the driver
++ * still returns 0 (success) for every failure -- counted, not yet fixed. */
++uint32_t nn_esp32_tx_outcome[16];
++
+ void IRAM_ATTR esp_ieee802154_transmit_done(const uint8_t *tx_frame, const uint8_t *ack_frame,
+ 					    esp_ieee802154_frame_info_t *ack_frame_info)
+ {
+ 	esp32_data.ack_frame = ack_frame;
+ 	esp32_data.ack_frame_info = ack_frame_info;
++	nn_esp32_tx_outcome[0]++;
++	esp32_tx_result = 0;
+ 
+ 	k_sem_give(&esp32_data.tx_wait);
+ }
+@@ -283,6 +298,20 @@ void IRAM_ATTR esp_ieee802154_transmit_done(const uint8_t *tx_frame, const uint8
+ /* override weak function in components/ieee802154/esp_ieee802154.c of ESP-IDF */
+ void IRAM_ATTR esp_ieee802154_transmit_failed(const uint8_t *frame, esp_ieee802154_tx_error_t error)
+ {
++	nn_esp32_tx_outcome[1 + ((unsigned)error < 14 ? (unsigned)error : 14)]++;
++	switch (error) {
++	case ESP_IEEE802154_TX_ERR_NO_ACK:
++	case ESP_IEEE802154_TX_ERR_INVALID_ACK:
++		esp32_tx_result = -ENOMSG;
++		break;
++	case ESP_IEEE802154_TX_ERR_CCA_BUSY:
++	case ESP_IEEE802154_TX_ERR_COEXIST:
++		esp32_tx_result = -EBUSY;
++		break;
++	default:
++		esp32_tx_result = -EIO;
++		break;
++	}
+ 	k_sem_give(&esp32_data.tx_wait);
+ }
+ 
+@@ -345,11 +374,13 @@ static int esp32_tx(const struct device *dev, enum ieee802154_tx_mode tx_mode, s
+ 
+ 	if (err != 0) {
+ 		LOG_ERR("TX timeout");
+-	} else {
+-		handle_ack(data);
++		return -EIO;
+ 	}
+-
+-	return err == 0 ? 0 : -EIO;
++	if (esp32_tx_result != 0) {
++		return esp32_tx_result;         /* let the MAC retry */
++	}
++	handle_ack(data);
++	return 0;
+ }
+ 
+ static int esp32_start(const struct device *dev)

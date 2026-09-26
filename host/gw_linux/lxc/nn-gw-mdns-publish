@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Host-side mDNS publisher for the gw_linux LXC container.
+#
+# Reads the container's persisted gateway identity from
+# /var/lib/nn-gw/kv/gw_identity/p256_priv, computes the same
+# "nn-gw-XXXXXX" instance name gw_linux uses internally (SHA-256 of
+# the P-256 pub, last 3 bytes), and execs avahi-publish-service.
+
+set -euo pipefail
+
+STATE_DIR=${STATE_DIR:-/var/lib/nn-gw}
+PORT=${PORT:-8770}
+PRIV="${STATE_DIR}/kv/gw_identity/p256_priv"
+
+if [[ ! -s "${PRIV}" ]]; then
+    echo "no gateway identity at ${PRIV} yet — waiting" >&2
+    # Poll until the container generates one; cap at 60 s so a stuck
+    # state still surfaces as a restart event in journalctl.
+    for _ in {1..60}; do
+        sleep 1
+        if [[ -s "${PRIV}" ]]; then break; fi
+    done
+fi
+if [[ ! -s "${PRIV}" ]]; then
+    echo "still no identity after 60s; aborting" >&2
+    exit 1
+fi
+
+# Derive gateway_id = SHA256(p256_pub)[:8], then the mDNS instance
+# name "nn-gw-XXXXXX" (last 3 bytes of gateway_id in uppercase hex).
+# gw_linux does this in fw_common/src/gw_identity.c — we mirror it.
+NAME=$(python3 - <<PY
+import hashlib, sys
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
+raw = open("${PRIV}", "rb").read()
+priv = ec.derive_private_key(int.from_bytes(raw, "big"), ec.SECP256R1())
+pub65 = priv.public_key().public_bytes(
+    encoding=serialization.Encoding.X962,
+    format=serialization.PublicFormat.UncompressedPoint)
+gw_id = hashlib.sha256(pub65).digest()[:8]
+# Match fw_common/gw_identity.c + gw_net_prov_backend.c: the device
+# advertising name uses bytes [3..5] of gw_id (the "last three of the
+# first six", mirroring the MAC-tail convention from the BLE name).
+last3 = gw_id[3:6]
+print(f"nn-gw-{last3[0]:02X}{last3[1]:02X}{last3[2]:02X}")
+PY
+)
+
+echo "publishing _nn-gw._tcp instance '${NAME}' on port ${PORT}"
+exec avahi-publish-service -s "${NAME}" _nn-gw._tcp "${PORT}"

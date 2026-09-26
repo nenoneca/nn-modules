@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# fw_common's Zephyr-side sources (kvstore, gw_ble_prov_backend) now
+# go through nn_osal_*; pull its Kconfig into scope so the `select`
+# below resolves when an app sources only fw_common/Kconfig.
+rsource "../nn_osal/Kconfig"
+rsource "../nn_pal/Kconfig"
+
+config FW_COMMON
+	bool "Platform-neutral firmware logic shared between Zephyr apps and the Linux gateway daemon"
+	default y if NODE_MGR
+	select NN_OSAL
+	help
+	  Pulls in shared sources that have no Zephyr-subsystem deps beyond
+	  the LOG shim in fw_common/log.h: HDLC byte framing, Spinel
+	  encode/decode, hub_crypto (X25519 + ECIES v2), nn_proto frame
+	  codec, and a few other portable state-machine pieces.
+
+	  The same sources also compile under plain Linux as part of
+	  host/gw_linux/ via a separate native CMake build.

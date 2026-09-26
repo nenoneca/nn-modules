@@ -1,0 +1,65 @@
+# T2 · Wi-Fi cases.  Same record shape as the rest of cts/cases/.
+
+cases:
+
+  - id:       T2-WIFI-02
+    contract: |
+      Wi-Fi status (state, address, signal) describes the interface that
+      actually carries the connection, on a board with more than one radio.
+    level:    must
+    peers:    the bench access point
+    setup: |
+      Two wireless interfaces present, one of them unable to connect (no
+      firmware, wrong band, or unplugged mid-test), in whichever probe order
+      the platform happens to produce.
+    stimulus: provision credentials and wait for the join
+    pass: |
+      The reported address is the one on the connected interface, and the
+      result does not change if the two interfaces enumerate in the opposite
+      order.  Choosing "the first wireless interface" fails whenever the dead
+      one enumerates first.
+    evidence: the interface list with MACs and addresses; the status reported
+    seen: |
+      BeagleY-AI, 2026-09-14 (E2E run 1).  The POSIX backend picks the first
+      interface with a phy80211 link.  With a USB dongle attached, the dongle
+      (no firmware) enumerated as wlan0 and the onboard cc33xx as wlan1 -- the
+      reverse of the previous card.  The join itself worked (iwd connects on
+      any capable interface), but status polling would have watched the dead
+      one.  Interface numbers follow probe order, the same class as the
+      unstable video and remoteproc numbering.
+
+  - id:       T2-WIFI-03
+    contract: |
+      A provisioned device that loses its uplink gets it back without a
+      person: first by restarting the Wi-Fi stack, then by rebooting, and a
+      long outage does not turn into rebooting forever at a fixed interval.
+      Setup mode (unprovisioned) is never treated as an outage.
+    level:    must
+    peers:    the bench access point (or a way to make the gateway silent)
+    setup: |
+      Provisioned device on the network, thresholds shortened for the bench
+      (Linux image: /etc/nn/netwatch.conf, e.g. restart 60 s, reboot 120 s).
+    stimulus: |
+      (a) Remove the uplink briefly (drop the default route, or stop the AP)
+          and restore it before the reboot threshold.
+      (b) Keep the gateway silent past the reboot threshold, twice in a row.
+      (c) Clear provisioning and leave the device in setup mode past both
+          thresholds.
+    pass: |
+      (a) Wi-Fi restarts once at the first threshold and the device is back
+          without rebooting.  (b) It reboots at the second threshold, and the
+          next reboot for the same outage waits longer than the first; the
+          back-off clears the first time the gateway answers.  (c) Nothing
+          happens.
+    evidence: device log of each decision with the elapsed outage; boot times
+    seen: |
+      Written 2026-09-15 with the BeagleY-AI uplink watchdog (nn-netwatch).
+      CONFIRMED on hardware the same day (E2E run 3, Jenkins image #5,
+      thresholds 60/120 s): (a) default route dropped -> iwd restarted at
+      65 s, uplink back at 130 s, no reboot; (b) AP made unreachable ->
+      reboot at 130 s (limit 120), then after the next boot at 249 s (limit
+      240), counter persisted as 2 and cleared on the first good check;
+      (c) unprovisioned + offline 4 min -> the check ran and did nothing.  Motivation: E2E run 2 recovered every
+      HUNG state automatically, but a live board without network is invisible
+      to the hardware watchdog -- systemd keeps petting it -- and it is the
+      failure a headless camera meets most.

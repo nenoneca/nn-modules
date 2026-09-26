@@ -1,0 +1,282 @@
+# HUB8735 ULTRA — Realtek RTL8735B (AmebaPro2), PS5268 sensor.
+#
+# Written BEFORE any backend code, which is the order the suite asks for: the
+# platform declares its seams, then the matrix says what is missing.  Nothing
+# here has been run against hardware; every "verified" line below was checked
+# against vendor documentation, and every "UNKNOWN" is a real gap in what we
+# know, not a placeholder someone forgot.
+#
+# VERIFIED from vendor material (amebaiot.com, aiot.realmcu.com, the
+# AmebaPro2 RTOS SDK docs and the ideashatch/HUB-8735 BSP):
+#   SoC        RTL8735B, 32-bit ARMv8-M (Cortex-M33 class) up to 500 MHz
+#   memory     768 KB ROM, 512 KB SRAM, 16 MB flash, MCM DDR2/DDR3L to 128 MB
+#   radios     802.11 a/b/g/n dual band 2.4/5 GHz, BLE 5.1
+#   NPU        integrated "Intelligent Engine" @ 0.4 TOPS
+#   video      ISP + H.264/H.265 encode; 1080p30 + 720p30, or 2K24
+#   sensor     PS5268 is supported by the SDK at 1920x1080@30; the sensor
+#              list lives in project/realtek_amebapro2_v0_example/inc/sensor.h
+#              and the sensor DRIVERS SHIP AS BINARIES, not source
+#   buses      2x SPI, 2x I2C, 3x UART, 9x PWM, 5x ADC, USB, SD host
+#
+# THE FACT THAT SHAPES EVERYTHING: this is a microcontroller running FreeRTOS,
+# not Linux.  BeagleY was cheap because it reused the posix backends almost
+# whole -- glibc, BlueZ, iwd, V4L2, GStreamer, an LXC container.  HUB8735
+# shares none of that.  Every seam needs new code, and the closest existing
+# model is esp_idf (FreeRTOS, MCU, no POSIX filesystem), NOT posix.
+
+platform: hub8735
+description: >
+  Winstec HUB8735 ULTRA AIoT module: Realtek RTL8735B / AmebaPro2 (Cortex-M33,
+  FreeRTOS) with a PS5268 1080p sensor.
+
+# arm-none-eabi is the family; the AmebaPro2 SDK pins its own "asdk" build of
+# it, and that pinned toolchain is what must be used -- a distro
+# arm-none-eabi-gcc will compile the census but is not what the vendor links
+# against.
+# The SDK ships its own GCC and the prefix is arm-elf-, not arm-none-eabi-.
+# Extract it with the README's command:
+#   cd <sdk>/tools && cat asdk-10.3.0-*-x86_64.tar.bz2.* | tar jxf -
+#   export PATH=$PATH:<sdk>/tools/asdk-10.3.0/linux/newlib/bin
+cc: arm-elf-gcc
+nm: arm-elf-nm
+
+# NN_AMBPRO2_SDK overrides the path; this default is where it is checked out
+# on the dev machine.  The FreeRTOS port is ARM_CM33_NTZ (non-TrustZone)
+# non_secure -- verified by compiling against it, the plain ARM_CM33 port was
+# not needed.
+# The SDK path comes from the environment, never from this file:
+#   export NN_AMBPRO2_SDK=/path/to/ambpro2_sdk
+# FreeRTOS port is ARM_CM33_NTZ (non-TrustZone) non_secure -- established by
+# compiling against it; the plain ARM_CM33 port was not the one.
+cflags:
+  - -std=c11
+  - -mcpu=cortex-m33
+  - -mthumb
+  - -Wall
+  - -Wextra
+  - -Wno-unused-parameter
+  - -Os
+  - -ffreestanding
+  - -I${NN_AMBPRO2_SDK}/component/os/freertos/freertos_v202012.00/Source/include
+  - -I${NN_AMBPRO2_SDK}/component/os/freertos/freertos_v202012.00/Source/portable/GCC/ARM_CM33_NTZ/non_secure
+  - -I${NN_AMBPRO2_SDK}/project/realtek_amebapro2_v0_example/inc
+  - -I${NN_AMBPRO2_SDK}/component/os/freertos
+
+# "objects": completeness is checked with nm over compiled objects rather than
+# a hosted link.  A freestanding target cannot link a hosted main(), and its
+# real link needs the SDK's linker script and blobs -- but completeness never
+# needed a link, only the question "is every symbol the census references
+# defined somewhere in the backend".  So this is a REAL verdict, not the
+# compile-only "inconclusive" this file used to carry.
+linkable: objects
+
+defines:
+  # No backend exists yet.  This name is the one a new nn_osal/nn_pal backend
+  # directory should use (modules/libs/nn_{osal,pal}/src/ameba/), matching the
+  # vendor's own name for the software platform rather than the module's.
+  - CONFIG_NN_OSAL_BACKEND_AMEBA=1
+  - CONFIG_NN_PAL_BACKEND_AMEBA=1
+
+# Nothing is skipped.  Every seam header compiles for this target, because the
+# internal backend headers now carry an AMEBA branch, and every declared
+# function is DEFINED by the generated -ENOTSUP backend under
+# modules/libs/nn_{osal,pal,infer}/src/ameba/.
+#
+# So T0 passes here and means exactly what it should: the seam is COMPLETE and
+# none of it works.  The port's work plan is the TODO(ameba) comments in those
+# stub files, in the dependency order noted below -- not this list.
+#
+# ORDER OF WORK, and the trap in each:
+#   thread, sync   FreeRTOS tasks and static semaphores.  DECIDE recursive vs
+#                  non-recursive for the mutex and make T1 assert it; an
+#                  unstated lock assumption deadlocked the BlueZ backend.
+#   time, work     work has no FreeRTOS primitive: a task draining a queue,
+#                  delayables held by a software timer.
+#   storage        flash-backed kv.  Must implement register-then-load AND
+#                  survive a restart (T1 re-execs a fresh process to check).
+#   socket         lwIP is already in the SDK.
+#   log, system, watchdog, gpio, uart, shell
+#                  the watchdog is hardware here -- wire it, do not stub it.
+#   wifi           the SDK's own API, not wpa_supplicant or iwd.
+#   ble            Realtek's BT stack, not NimBLE and not BlueZ.  The six
+#                  e7f000xx UUIDs must come out byte-identical (T0-BLE-01).
+#   dfu, mdns, log_sink
+#   openthread     no 802.15.4 on this part: this one stays -ENOTSUP forever,
+#                  which is why the stubs return it rather than being absent.
+#   nn_infer       needs pal_ameba_npu.c and a converted model (see below).
+skip_groups_none_needed: true
+_skip_groups_was:
+  # --- nn_osal: needed first, everything else sits on it ---
+  - nn_osal/thread.h        # FreeRTOS tasks; closest model is src/esp_idf
+  - nn_osal/sync.h          # FreeRTOS mutex/semaphore. NOTE: decide and
+                            # DOCUMENT recursive vs not -- an unstated lock
+                            # assumption cost a day on BlueZ (T1 sync case)
+  - nn_osal/time.h
+  - nn_osal/work.h          # no posix branch exists either; esp_idf is the model
+  - nn_osal/storage.h       # kv: flash-backed. MUST implement register-then-load
+                            # AND survive a restart (T1 kv re-exec case)
+  - nn_osal/socket.h        # lwIP on this SDK
+  - nn_osal/log.h
+  - nn_osal/system.h
+  - nn_osal/watchdog.h      # RTL8735B has one; wire it, do not stub it
+  - nn_osal/gpio.h
+  - nn_osal/uart.h
+  - nn_osal/shell.h
+  - nn_osal/buf.h
+  # --- nn_pal: the radios ---
+  - nn_pal/wifi.h           # SDK's own wifi API, not wpa_supplicant/iwd
+  - nn_pal/ble.h            # Realtek's BT stack, NOT NimBLE and NOT BlueZ.
+                            # BLE 5.1. The provisioning service and the six
+                            # e7f000xx UUIDs must come out byte-identical
+                            # (T0-BLE-01 pins the text form)
+  - nn_pal/dfu.h            # OTA against the SDK's own image layout
+  - nn_pal/mdns.h
+  - nn_pal/log_sink.h
+  - nn_pal/openthread.h     # no 802.15.4 on this part: this one is a genuine
+                            # -ENOTSUP group, not a to-do
+  # --- inference ---
+  - nn_infer/nn_infer.h     # needs pal_ameba_npu.c
+  - nn_infer/policy.h
+
+sources:
+  - modules/libs/nn_osal/src/ameba/*.c
+  - modules/libs/nn_pal/src/ameba/*.c
+  - modules/libs/nn_infer/src/ameba/*.c
+
+# ---------------------------------------------------------------------------
+# What must come WITH the board, per the suite's "what to bring" list.  These
+# are blockers, not paperwork: each one gates a tier.
+needed_from_vendor:
+  - name: SDK and pinned toolchain
+    gates: T0
+    why: >
+      T0 cannot link without the SDK's linker script, FreeRTOS port and
+      libraries; and nnbuild needs a container image with the pinned asdk
+      toolchain before T0 can run in Jenkins on every push.
+  - name: NPU model format — LARGELY RESOLVED by the HUB-8735 Arduino BSP
+    gates: T3 inference
+    status: mostly answered; kept here because one part still needs a decision
+    why: >
+      The engine is a VeriSilicon/Vivante VIP, driven through the media
+      framework's "vipnn" module (vipnn_control, nn_load_model_src_sel), and
+      its model format is .nb — a network binary graph, not ONNX and not TIDL.
+      The earlier worry was that we would have to commission a conversion of
+      the reference detector before T3 could run at all.  We do not: the BSP
+      ships PRE-CONVERTED detectors, including yolov4_tiny.nb (4.0 MB),
+      yolov7_tiny.nb (4.5 MB) and yolov3_tiny.nb, plus mobilefacenet, scrfd,
+      centerface, mbnetssd, retinaface and yamnet.
+    remaining_decision: >
+      Which detector this platform's T3 uses.  BeagleY's reference is a
+      TIDL-compiled yolox-s-lite; hub8735 would use a shipped YOLO-tiny.  Those
+      are different models, so T3's "reference set yields the expected classes
+      with IoU >= 0.5" has to be stated per platform, against that platform's
+      model, or the case compares two things and proves neither.  Converting
+      our own yolox to .nb with Vivante's toolkit stays an option and is no
+      longer on the critical path.
+    budget_note: >
+      A 4 MB model in 16 MB of flash is a real budget item, not a rounding
+      error: models are flashed into the FWFS partition and declared in
+      GCC-RELEASE/mp/amebapro2_fwfs_nn_models.json.
+  - name: PS5268 sensor driver + IQ binaries — RESOLVED 2026-09-13
+    gates: T3 capture, and the whole camera
+    status: resolved; only "confirm the fitted part" remains, and it is not blocking
+    resolution: >
+      The binaries ARE public, in the upstream Arduino SDK:
+      Ameba-AIoT/ameba-arduino-pro2, Arduino_package/ameba_pro2_tools_linux/
+      misc/video_img/ carries sensor_ps5268.bin (3724 B) and iq_ps5268.bin
+      (21553 B), and PS5268 is a Camera Option in its AMB82-MINI and
+      AMB82-ZERO board menus.  Copies with sha256 are kept in
+      hub8735-work/vendor/sensors/.  There is NO fcs_data_ps5268.bin, so fast
+      camera start is not available with this sensor.
+    how_this_was_missed: >
+      Worth recording, because it cost a vendor email that nearly went out.
+      The earlier "no PS5268 anywhere" was checked against three trees: the
+      KVS-LTS SDK fork, upstream ambiot/ambpro2_sdk, and the HUB-8735 BSP.  All
+      three carry only F37.  The RTOS SDK does not ship sensor binaries at all,
+      and the HUB-8735 BSP bundles an OLD copy of the Arduino package from
+      before these sensors were added.  The current Arduino SDK was the one
+      place not checked, and it is where Realtek publishes them.  Lesson: for
+      AmebaPro2, sensor binaries live in ameba-arduino-pro2, not in the RTOS
+      SDK -- look there first.
+    wiring_into_the_rtos_sdk: >
+      Copy sensor_ps5268.bin and iq_ps5268.bin into
+      component/soc/8735b/fwlib/rtl8735b/lib/source/ram/video/voe_bin, add
+      SENSOR_PS5268 (0x0F) to inc/sensor.h's sen_id[] and set USE_SENSOR, add
+      "iq_ps5268" to manual_iq[], and add a SENSOR_SET entry to
+      mp/amebapro2_sensor_set.json and mp/amebapro2_isp_iq.json.  The HUB-8735
+      BSP's sensor.h already has the id and the 1920x1080@30 params to copy.
+  - name: A way to cut power from the bench
+    gates: T1 watchdog, T3 firmware readiness
+    why: >
+      Both need cold boots, and the co-processor readiness case wants ten of
+      them.  Learned from cam4: a wedged board needed an operator trip, twice.
+
+# ---------------------------------------------------------------------------
+# Decisions taken 2026-09-13 (operator).
+decisions:
+  milestone: >
+    FULL T0-T4 in one milestone.  hub8735 is certified when every must case in
+    every tier is green on hub8735 itself -- no partial milestone at T0+T1.
+  t3_detector: >
+    yolov7_tiny.nb, the pre-converted model the HUB-8735 BSP ships (4.5 MB).
+    T3's accuracy criterion is written for this model on this platform, not
+    borrowed from BeagleY's TIDL yolox-s-lite: they are different models and a
+    case comparing them would prove neither.
+  sensor_plan: >
+    Ask Winstec which sensor is actually fitted, and for sensor_ps5268.bin +
+    iq_ps5268.bin if it is PS5268.  In parallel, use an AMB82-mini (same SoC
+    family, JXF37 sensor) as a stand-in -- see amb82mini.yaml -- so capture,
+    encode, inference and E2E are proven without waiting.  Results on the
+    stand-in are recorded against amb82mini, never credited to hub8735.
+
+# ---------------------------------------------------------------------------
+# Reference implementations for every seam, from the HUB-8735 Arduino BSP
+# (github.com/ideashatch/HUB-8735).  This matters more than it sounds: rather
+# than writing each backend against closed documentation, there is working C++
+# for this exact module, over a full SDK component tree, that we can read to
+# find the API each seam binds to.
+reference_implementations:
+  ble: >
+    libraries/BLE — Realtek's own GAP/GATT C API: le_adv_start, le_adv_set_param,
+    le_set_gap_param, le_get_conn_param, gap_set_param, le_bond_*.  Not NimBLE,
+    not BlueZ, so nn_pal/ble.h's backend is new code — but the peripheral,
+    advertising and connection-callback shapes all have a worked example here.
+  wifi: libraries/WiFi over component/wifi.
+  capture_and_encode: >
+    libraries/Multimedia — and this is the architectural find.  AmebaPro2's
+    media path is a graph of "mm_module"s wired together (mm_module_open,
+    mm_module_ctrl, mm_module_close) with isp_set_* for image controls.  That
+    is structurally the same idea as GStreamer elements, so nn-camera's
+    capture_gst.c has a real analogue here rather than needing a different
+    design: a capture_mmf.c that builds the module graph and hands out access
+    units the same way.
+  inference: >
+    libraries/NeuralNetwork — vipnn_control plus nn_load_model_src_sel.  The
+    NPU is reached as another mm_module in the same graph, so inference and
+    capture are one pipeline rather than two subsystems.
+  osal_bits: libraries/Watchdog, GPIO, GTimer, FileSystem, RTC, SPI, Wire.
+  caution: >
+    These are Arduino wrappers.  Read them for the API mapping and the call
+    order, not as a style to copy: they assume a single sketch, they are
+    generous with globals, and their error handling is thinner than anything
+    that should sit under nn_pal.
+
+# ---------------------------------------------------------------------------
+# Open questions to settle before the port is designed.  Unknown is recorded
+# as unknown; none of these should be guessed.
+unknowns:
+  - >
+    RAM budget.  512 KB SRAM plus MCM DDR, and this module's DDR size is not
+    confirmed.  nn-camera as it exists is a Linux process built around
+    GStreamer; on FreeRTOS it has to be restructured around the SDK's own
+    media framework, and how much of the app fits is the first thing to
+    measure, not the last.
+  - >
+    Whether BLE 5.1 and dual-band Wi-Fi coexist well enough to keep setup
+    mode available while streaming, or whether this platform needs the same
+    "radio off when provisioned" policy as the ESP32 camera.  The suite's
+    T2 coex case is there to measure it rather than assume it.
+  - >
+    Whether the H.264 the SDK's encoder produces is conformant at the
+    resolutions the app asks for.  The P4 encoder was not, at one resolution,
+    and it took a reference decoder to find out.

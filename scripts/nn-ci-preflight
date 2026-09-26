@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# nn-ci-preflight — prove a Jenkins job will get past its environment BEFORE
+# firing it.
+#
+#   nn-ci-preflight nn-byai-image              # check only
+#   nn-ci-preflight nn-byai-image --fire       # check, and trigger on PASS
+#   nn-ci-preflight nn-byai-image --bin DIR    # test candidate scripts in DIR
+#                                              # instead of the installed ones
+#
+# WHY RUN IT INSIDE THE AGENT.  nn-byai-image build #1 died in its second stage
+# on "python3: command not found": nn-fetch-vendor runs on the bare agent, and
+# the agent container has no python3.  Nothing about the build itself was
+# wrong -- the HOST it ran on was different from the host the script was
+# written on.  The only check that catches that class is one that runs where
+# Jenkins runs, so every step below executes via `docker exec` in the actual
+# agent container, as the agent's own user, against the agent's own bin.
+#
+# WHAT IT DOES NOT DO.  It does not run the multi-hour image build.  That stage
+# already runs inside nn-build:byai-image through nnbuild, which is exactly why
+# it is reproducible; the preflight checks the image exists and leaves the
+# build to Jenkins.  It also does not publish anything: nn-publish has no dry
+# run, so its dependencies are checked instead of the script being run.
+set -uo pipefail
+
+JOB="${1:?usage: nn-ci-preflight <job> [--fire] [--bin DIR]}"; shift
+FIRE=0; BIN=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fire) FIRE=1; shift ;;
+        --bin)  BIN="$2"; shift 2 ;;
+        *) echo "nn-ci-preflight: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+# The scripts under test are the ones the JOB runs, read from the job's own
+# pipeline ("def BIN = '...'"), not a hard-coded default.  The first version
+# assumed nn-jenkins/bin; nn-byai-image then moved to bin-byai (because the
+# 2-minute mirror-sync timer rewrites bin/ and had silently reverted a
+# hand-installed script), and a preflight still testing bin/ would have
+# certified scripts the job no longer uses.  --bin overrides, for candidates.
+ENVF="${NN_JENKINS_ENV:-$HOME/.config/nn/jenkins.env}"
+if [ -z "$BIN" ]; then
+    if [ -r "$ENVF" ]; then
+        # shellcheck disable=SC1090
+        set -a; . "$ENVF"; set +a
+        BIN=$(curl -s -u "$JENKINS_USER:$JENKINS_TOKEN" "$JENKINS_URL/job/$JOB/config.xml" \
+              | python3 -c "import sys,re,html; m=re.search(r\"def BIN\\s*=\\s*'([^']+)'\", html.unescape(sys.stdin.read())); print(m.group(1) if m else '')")
+    fi
+    if [ -z "$BIN" ]; then
+        echo "nn-ci-preflight: could not read the script dir from job '$JOB'" >&2
+        echo "nn-ci-preflight: (no $ENVF, or no \"def BIN\" in its pipeline); pass --bin DIR" >&2
+        exit 2
+    fi
+    BIN_FROM="read from the job"
+else
+    BIN_FROM="given with --bin"
+fi
+
+AGENT="${NN_CI_AGENT:-jenkins-agent-agent-1}"
+STAGE="${NN_CI_STAGE:-/media/chalos/mx500/nn-jenkins/tmp}"
+fails=0
+ok()   { printf '  PASS  %s\n' "$*"; }
+bad()  { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+note() { printf '  ....  %s\n' "$*"; }
+# Everything runs in the agent, as the agent's user, the way Jenkins runs it.
+in_agent() { docker exec "$AGENT" bash -c "$*"; }
+
+echo "── preflight: $JOB  (agent $AGENT, scripts from $BIN, $BIN_FROM)"
+
+docker inspect "$AGENT" >/dev/null 2>&1 || {
+    echo "  FAIL  agent container '$AGENT' is not running" >&2; exit 1; }
+
+# --- things every job needs on the bare agent ------------------------------
+for t in git docker sha256sum; do
+    if in_agent "command -v $t >/dev/null"; then ok "agent has $t"
+    else bad "agent is missing $t"; fi
+done
+in_agent "docker version >/dev/null 2>&1" \
+    && ok "agent can reach the docker daemon" \
+    || bad "agent cannot talk to docker (socket not mounted?)"
+in_agent "test -d '$BIN'" \
+    && ok "script dir is visible inside the agent" \
+    || bad "$BIN is not visible inside the agent (it must live under a path the agent mounts)"
+
+# Where a step can be RUN safely, the preflight runs it -- that is the only
+# check that sees the agent the way Jenkins does.  Grepping a script for
+# "python3" cannot tell a bare call from one inside a container, and the first
+# version of this file got exactly that wrong.  needs() is for the steps that
+# cannot be run without side effects: it checks the tools they call directly.
+needs() {   # needs <script> <tool>...
+    local s="$1"; shift
+    in_agent "test -x '$BIN/$s'" || { bad "$s: not installed in $BIN"; return; }
+    for t in "$@"; do
+        if in_agent "command -v $t >/dev/null"; then ok "$s: agent has $t"
+        else bad "$s: calls $t on the bare agent, and the agent has no $t"; fi
+    done
+}
+
+case "$JOB" in
+nn-byai-image)
+    # stage 'vendor blobs'
+    needs nn-fetch-vendor docker
+    # Run it for real: it is a few MB, and it is the stage that has failed.
+    W="$STAGE/preflight-$$"
+    if in_agent "mkdir -p '$W' && '$BIN/nn-fetch-vendor' cc33xx-1.0.2.10 '$W/vendor-fw'" > "/tmp/nn-ci-preflight-$$.log" 2>&1; then
+        ok "nn-fetch-vendor fetched and verified cc33xx-1.0.2.10 inside the agent"
+    else
+        bad "nn-fetch-vendor failed inside the agent:"
+        sed 's/^/          /' "/tmp/nn-ci-preflight-$$.log" | tail -6
+    fi
+    in_agent "rm -rf '$W'"; rm -f "/tmp/nn-ci-preflight-$$.log"
+
+    # stage 'image'
+    in_agent "docker image inspect nn-build:byai-image >/dev/null 2>&1" \
+        && ok "build image nn-build:byai-image is present" \
+        || bad "build image nn-build:byai-image is missing (nnbuild would build it: slow, and a first-run failure point)"
+    needs nnbuild docker
+
+    # stage 'publish' -- no dry run exists, so dependencies only
+    needs nn-publish docker git sha256sum
+    in_agent "test -r /media/chalos/mx500/nn-jenkins/minio.env" \
+        && ok "MinIO credentials readable by the agent" \
+        || bad "MinIO credentials not readable by the agent"
+
+    # stage 'release' -- only runs when VERSION is set.  Run it for real in
+    # --dry-run, which nn-release documents as "validates the artifact set +
+    # release plan with zero side effects", against the artifact this job
+    # actually releases: byai_sdcard.  The 2026-09-10 proof builds published
+    # one, so there is always something to dry-run against.
+    #
+    # Earlier this pointed at byai_camera and "failed" -- but only because a
+    # .tar.gz is not an image nn-release handles.  Test the artifact the job
+    # releases, or the check measures the wrong thing.
+    #
+    # The version cannot be invented either.  nn-release refuses to publish an
+    # artifact under a version its own manifest does not claim -- that mismatch
+    # is how a build ends up released under someone else's tag -- so a fixed
+    # "0.0.0-preflight" failed every single run, for the one reason that says
+    # nothing about whether the job would work.  Ask the published artifact
+    # what version it is; its manifest's FILENAME carries it, so this needs no
+    # JSON parser (the agent has no python3).
+    REL_VER="$(in_agent 'set -a; . /media/chalos/mx500/nn-jenkins/minio.env; set +a
+: "${NN_MINIO_ENDPOINT:=http://127.0.0.1:9000}"; : "${NN_MINIO_BUCKET:=nn-images}"
+docker run --rm --network host --entrypoint mc \
+    -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+    minio/mc:latest --json ls "nn/$NN_MINIO_BUCKET/byai_sdcard/nn-byai-image/latest/" 2>/dev/null' \
+      | grep -o 'byai_sdcard-[A-Za-z0-9._-]*\.manifest\.json' | head -1 \
+      | sed 's/^byai_sdcard-//; s/\.manifest\.json$//')"
+    if [ -z "$REL_VER" ]; then
+        bad "no published byai_sdcard artifact in MinIO to dry-run a release against"
+    elif in_agent "'$BIN/nn-release' byai_sdcard '$REL_VER' --pipeline nn-byai-image --dry-run" \
+         > "/tmp/nn-ci-preflight-rel-$$.log" 2>&1; then
+        ok "nn-release --dry-run for byai_sdcard $REL_VER completed inside the agent"
+    else
+        bad "nn-release --dry-run for byai_sdcard failed inside the agent -- a build WITH a VERSION would fail at 'release'"
+        grep -vE '│|┌|└|-> ' "/tmp/nn-ci-preflight-rel-$$.log" | sed 's/^/          /' | tail -4
+        in_agent "grep -q 'img.xz\\|sdcard' '$BIN/nn-release'" \
+            || note "the installed nn-release has no sdcard/img.xz handling at all (it only takes *.signed.bin)"
+    fi
+    rm -f "/tmp/nn-ci-preflight-rel-$$.log"
+    ;;
+*)
+    echo "nn-ci-preflight: no checks written for job '$JOB' yet" >&2
+    exit 2 ;;
+esac
+
+echo
+if [ "$fails" -gt 0 ]; then
+    echo "  PREFLIGHT FAILED: $fails problem(s).  Not firing $JOB -- it would fail the same way."
+    exit 1
+fi
+echo "  PREFLIGHT PASSED for $JOB."
+
+if [ "$FIRE" = 1 ]; then
+    ENVF="${NN_JENKINS_ENV:-$HOME/.config/nn/jenkins.env}"
+    [ -r "$ENVF" ] || { echo "  cannot fire: no $ENVF" >&2; exit 1; }
+    # shellcheck disable=SC1090
+    set -a; . "$ENVF"; set +a
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+                -u "$JENKINS_USER:$JENKINS_TOKEN" "$JENKINS_URL/job/$JOB/build")
+    case "$code" in
+        201|200) echo "  fired $JOB (HTTP $code)" ;;
+        *) echo "  firing $JOB returned HTTP $code" >&2; exit 1 ;;
+    esac
+fi

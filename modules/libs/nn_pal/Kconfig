@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig NN_PAL
+	bool "nn project Platform Abstraction Layer"
+	default n
+	help
+	  Wraps protocol subsystems (BLE, DFU, OpenThread, WiFi, mDNS)
+	  behind a stable nn_pal_* API so apps + libs can stop including
+	  <zephyr/bluetooth/...>, <zephyr/dfu/...>, <zephyr/net/openthread.h>,
+	  <zephyr/net/wifi*>, <zephyr/net/dns_sd.h> directly.  Sister to
+	  NN_OSAL — see modules/libs/nn_pal/docs/P7_scope.md.
+
+if NN_PAL
+
+choice
+	prompt "nn_pal backend"
+	default NN_PAL_BACKEND_ZEPHYR
+	help
+	  Which platform backend to compile.
+
+config NN_PAL_BACKEND_ZEPHYR
+	bool "Zephyr (BT host + dfu + net/openthread + wifi_mgmt + dns_sd)"
+	help
+	  Backend wraps Zephyr's protocol stacks.  Selected by default
+	  on Zephyr targets.
+
+endchoice
+
+# Per-PAL subsystem gates.  Each backend source compiles only when its
+# matching Zephyr stack is also enabled, so an app that doesn't use BLE
+# (e.g. ncp_host_esp32c6) doesn't drag in the BT host headers.
+
+config NN_PAL_MDNS
+	bool "mDNS / DNS-SD PAL surface"
+	default y if NET_HOSTNAME_ENABLE
+	help
+	  Compiles nn_pal_mdns_*.  Backend depends on
+	  <zephyr/net/hostname.h> and <zephyr/net/dns_sd.h>.
+
+config NN_PAL_WIFI
+	bool "WiFi STA PAL surface"
+	default y if NET_L2_WIFI_MGMT
+	help
+	  Compiles nn_pal_wifi_*.  Backend depends on
+	  <zephyr/net/wifi.h> + wifi_mgmt.h.
+
+config NN_PAL_OPENTHREAD
+	bool "OpenThread PAL surface"
+	default y if NET_L2_OPENTHREAD
+	help
+	  Compiles nn_pal_ot_*.  Backend depends on
+	  <zephyr/net/openthread.h> + the openthread module headers.
+
+config NN_PAL_BLE
+	bool "BLE GATT PAL surface"
+	default y if BT
+	select BT_GATT_DYNAMIC_DB if BT
+	help
+	  Compiles nn_pal_ble_*.  Backend depends on the Zephyr BT host
+	  headers.  Selects BT_GATT_DYNAMIC_DB so the backend can build
+	  the GATT attribute table at runtime instead of via the
+	  compile-time BT_GATT_SERVICE_DEFINE macro.
+
+config NN_PAL_DFU
+	bool "DFU / image management PAL surface"
+	default y if BOOTLOADER_MCUBOOT
+	help
+	  Compiles nn_pal_dfu_*.  Backend depends on
+	  <zephyr/dfu/flash_img.h> + <zephyr/storage/flash_map.h>.
+
+config NN_PAL_LOG_SINK
+	bool "Runtime log-backend registration PAL surface"
+	default y if LOG
+	help
+	  Compiles nn_pal_log_sink_*.  Backend implements a Zephyr
+	  LOG_BACKEND_DEFINE that forwards each processed message to a
+	  caller-registered callback (used by node_mgr/coap_log.c to
+	  emit D2H LOG_LINE frames).
+
+endif # NN_PAL

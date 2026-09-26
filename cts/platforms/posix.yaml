@@ -1,0 +1,66 @@
+# The posix/Linux platform, as the BeagleY camera uses it.  This file is the
+# reference shape for a new platform's declaration, and it is also an honest
+# record of how narrow the posix backend actually is.
+platform: posix
+description: Linux host and BeagleY-AI camera (glibc, BlueZ over sd-bus, iwd)
+
+cc: cc
+linkable: yes
+cflags: -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wno-unused-parameter -O0 -g
+ldflags: -lsystemd -lpthread
+
+defines:
+  - CONFIG_NN_OSAL_BACKEND_POSIX=1
+  - CONFIG_NN_PAL_BACKEND_POSIX=1
+
+# Seam header groups this platform does not supply AT ALL.  These are not
+# "-ENOTSUP" cases: the internal backend headers have no posix branch and
+# #error out, so the types do not exist and the group cannot even compile.
+# Recorded here so the narrowing is a declared decision rather than a quietly
+# smaller census, and so the conformance matrix can show it.
+skip_groups:
+  # No posix branch in the internal backend headers at all -- they #error, so
+  # the types do not exist and the group cannot even compile.
+  - nn_osal/uart.h
+  - nn_osal/watchdog.h
+  - nn_osal/work.h
+  # Whole seams this platform does not supply.  Declaring them here is the
+  # honest statement "posix does not do these", which the conformance matrix
+  # can show; leaving them in would report 47 missing symbols and bury the
+  # eight that are genuinely wrong.
+  - nn_pal/dfu.h
+  - nn_pal/mdns.h
+  - nn_pal/openthread.h
+  - nn_pal/log_sink.h
+
+sources:
+  - modules/libs/nn_osal/src/posix/*.c
+  - modules/libs/nn_pal/src/posix/*.c
+  # The inference PAL is chosen at build time; the stub exists precisely so a
+  # platform can be censused before its accelerator backend is written.
+  - modules/libs/nn_infer/src/pal/stub/*.c
+  - modules/libs/nn_infer/src/policy.c
+
+# Declared in a seam header this platform DOES supply, but with no
+# implementation.  Found by T0 on 2026-09-13, the first time the census ran.
+# These are the holes the plan predicted ("returns -ENOTSUP by accident"), and
+# they are worse than that: the symbols are simply absent, so a caller gets a
+# link error rather than a value it can check.
+#
+# Recorded rather than silently skipped, because both groups are real gaps a
+# port needs to know about, and T0 must still fail on the NEXT one.
+known_missing:
+  # nn_osal/shell.h has a POSIX branch in its internal backend header, so the
+  # platform claims the seam, but the four print/diagnostic entry points are
+  # not defined anywhere in src/posix.
+  - nn_osal_shell_error
+  - nn_osal_shell_print
+  - nn_osal_shell_print_v
+  - nn_osal_shell_warn
+  # The BlueZ backend is PERIPHERAL ONLY.  Central-role GATT is declared in
+  # nn_pal/ble.h and not implemented, which is exactly the gap that made the
+  # BLE central work on the beagle hub impossible without noticing first.
+  - nn_pal_ble_gatt_discover
+  - nn_pal_ble_gatt_read
+  - nn_pal_ble_gatt_subscribe
+  - nn_pal_ble_gatt_write

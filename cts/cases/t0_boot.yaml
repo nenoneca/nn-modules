@@ -1,0 +1,75 @@
+# T0 · boot container cases for the nn HAL compatibility suite.
+#
+# Record shape is the suite's: id, contract, level, peers, setup, stimulus,
+# pass, evidence, seen.  Written for ANY platform whose first-stage boot
+# loader authenticates a container of firmware images (TI K3 tispl.bin,
+# NXP imx-boot, a FIT with signed loadables) -- not for the BeagleY.
+
+cases:
+
+  - id:       T0-BOOT-01
+    contract: |
+      The boot container a build produces carries every firmware payload the
+      platform declares.  An optional entry that packed EMPTY is a build
+      failure, not a smaller image.
+    level:    must
+    peers:    none (build-time check on the produced artifacts)
+    setup: |
+      The platform declaration lists the images its boot container must hold,
+      with a floor size for each -- e.g. for TI K3: atf, tee (when OP-TEE is
+      enabled), dm, spl, fdt.
+    stimulus: |
+      After the build, list the container's images (dumpimage -l on a FIT) and
+      measure each payload.
+    pass: |
+      Every declared image is present and above its floor.  A payload no
+      bigger than its own signing certificate (about 1.7 KB for a TI x509
+      wrapper) means the entry is empty and FAILS, regardless of whether the
+      bootloader later accepts it.  Compare against a known-good container
+      where one exists: same images, same order, sizes within tolerance.
+    evidence: |
+      The image list with sizes, from the build and from the known-good
+      reference, side by side.
+    seen: |
+      BeagleY-AI, 2026-09-14, the first Jenkins-built Buildroot card
+      (nn-byai-image #1).  The defconfig handed U-Boot 2026.01 the OP-TEE ELF
+      (BR2_TARGET_UBOOT_NEEDS_OPTEE_TEE_ELF, TEE=tee.elf) as a workaround for a
+      binman "tee.elf not found" error.  binman's tee-os entry is optional, so
+      it packed a signed stub with no payload -- 1,700 bytes against 492,556 in
+      the known-good BeagleBoard tispl.bin -- plus about 4.5 MB of padding.
+      The build went green: nothing warns about an optional entry coming out
+      empty.  On hardware the R5 SPL authenticated four images and then TIFS
+      NAK'd the fifth (the DTB) with "Message not acknowledged / Authentication
+      failed! / Please RESET the board".  OP-TEE was built correctly all along
+      (tee-pager_v2.bin, 490,848 B); passing it raw, as upstream Buildroot's
+      beagley_ai_defconfig does, restores a 492,548-byte entry and a layout
+      matching the known-good one.  CONFIRMED on hardware: the corrected image,
+      with only tispl.bin changed, passed all five authentications, started
+      OP-TEE 4.6 and booted to login.  So the empty OP-TEE was also what made
+      TIFS reject the image AFTER it -- a failure that points at the wrong
+      image, which is exactly why a size check beats reading the error.  This
+      check would have stopped the card at build time, three hours and one
+      hardware round trip earlier.
+
+  - id:       T0-BOOT-02
+    contract: |
+      Every kernel module the image loads at boot is resolvable by the image's
+      own module tools: present in the module index, or built in.
+    level:    must
+    peers:    none (build-time check on the produced rootfs)
+    setup:    the produced rootfs, with its module index and modules-load.d
+    stimulus: |
+      Count the index entries against the module files, then resolve every
+      name listed in modules-load.d against the index and the built-in list.
+    pass: |
+      The index covers every module file, and every boot-time module resolves.
+      An index with fewer entries than module files means the module tools
+      cannot read the module format -- that is a FAIL even if the image boots.
+    evidence: the entry count, the file count, and any unresolved names
+    seen: |
+      BeagleY-AI, 2026-09-14 (E2E run 1).  The kernel xz-compressed its modules
+      and Buildroot's kmod had no xz support on host or target, so depmod
+      indexed nothing: modules.dep had 0 lines against 2,967 modules.  The
+      image booted to a login prompt with no driver loaded -- no Wi-Fi, no
+      Bluetooth -- and the only symptom was "modprobe: FATAL: Module ... not
+      found" for a file that was plainly there.

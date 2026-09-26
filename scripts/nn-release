@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# nn-release — promote a MinIO build to a GitHub release the hub's
+# `github` OTA source can consume.  MinIO is the archive/intermediate;
+# GitHub + local are the only OTA source kinds (unified-OTA rule).
+#
+#   nn-release <image> <version> [--build <build-id>] [--repo owner/name]
+#              [--flash <flash.sh>] [--dry-run] [--local <dir>]
+#
+# Flow: pull <image>/<pipeline>/<build|latest>/ from MinIO → assemble the
+# standard OTA asset set (image.signed.bin + manifest.json [+ flash.sh])
+# → create a GitHub release tagged <version> on the per-image repo.
+#
+# --dry-run does EVERYTHING except the GitHub API calls (and needs no
+# PAT): validates the artifact set + release plan with zero side effects.
+# --local <dir> installs the asset set into <dir>/<image>/<version>/ instead
+# of GitHub — the layout the hub's LocalDirSource reads (sync + promote
+# from there).  No PAT needed; nn-stage-hub wraps it for the bench hub.
+set -euo pipefail
+
+IMAGE="${1:?usage: nn-release <image> <version> [opts]}"
+VERSION="${2:?version/tag required}"
+shift 2
+BUILD="latest"; REPO=""; FLASH=""; DRY=0; LOCAL=""
+PIPELINE_DEFAULT="${NN_PIPELINE:-}"
+while [ $# -gt 0 ]; do case "$1" in
+  --build) BUILD="$2"; shift 2;;
+  --repo)  REPO="$2"; shift 2;;
+  --flash) FLASH="$2"; shift 2;;
+  --pipeline) PIPELINE_DEFAULT="$2"; shift 2;;
+  --dry-run) DRY=1; shift;;
+  --local) LOCAL="$2"; shift 2;;
+  *) echo "nn-release: unknown arg $1" >&2; exit 2;;
+esac; done
+REPO="${REPO:-chalos/$IMAGE}"           # per-image release repo default
+
+ENVF="${NN_MINIO_ENV:-/media/chalos/mx500/nn-jenkins/minio.env}"
+# shellcheck disable=SC1090
+[ -f "$ENVF" ] && . "$ENVF"
+: "${NN_MINIO_ACCESS:?}" "${NN_MINIO_SECRET:?}"
+: "${NN_MINIO_ENDPOINT:=http://127.0.0.1:9000}" "${NN_MINIO_BUCKET:=nn-images}"
+
+# which pipeline's artifacts to pull (the verify job that produced them)
+PIPELINE="${PIPELINE_DEFAULT:-}"
+if [ -z "$PIPELINE" ]; then
+    # first pipeline dir under the image that has the requested build
+    PIPELINE="$(docker run --rm --network host --entrypoint mc \
+        -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+        minio/mc:latest --json ls "nn/$NN_MINIO_BUCKET/$IMAGE/" 2>/dev/null \
+        | python3 -c "import json,sys;
+[print(json.loads(l)['key'].rstrip('/')) for l in sys.stdin if l.strip()]" 2>/dev/null | head -1)"
+fi
+[ -n "$PIPELINE" ] || { echo "nn-release: no pipeline dir for $IMAGE in MinIO" >&2; exit 3; }
+# --build accepts the Jenkins build NUMBER as well as the full "<n>-<sha>"
+# directory name nn-publish creates (a bare number is what people type).
+if printf '%s' "$BUILD" | grep -qE '^[0-9]+$'; then
+    _dir="$(docker run --rm --network host --entrypoint mc \
+        -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+        minio/mc:latest --json ls "nn/$NN_MINIO_BUCKET/$IMAGE/$PIPELINE/" 2>/dev/null \
+        | python3 -c "import json,sys,re
+b=sys.argv[1]
+for l in sys.stdin:
+    if not l.strip(): continue
+    k=json.loads(l)['key'].rstrip('/')
+    if re.fullmatch(b+r'-[0-9a-f]+', k): print(k); break" "$BUILD" 2>/dev/null || true)"
+    [ -n "$_dir" ] || { echo "nn-release: no build $BUILD under $IMAGE/$PIPELINE/ in MinIO" >&2; exit 3; }
+    BUILD="$_dir"
+fi
+SRC="$IMAGE/$PIPELINE/$BUILD"
+
+STAGE_ROOT="${NN_MINIO_STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}"
+
+# The agent that runs these scripts has no python3 (nn-byai-image #1 died on
+# "python3: command not found"), so when the host lacks it, run python3 inside
+# the pinned nn-build:host-ci image with the same paths mounted at the same
+# places -- every path these scripts touch is under STAGE_ROOT or the cwd.
+if [ "${NN_TOOLS_IN_CONTAINER:-0}" = 1 ] || ! command -v xz >/dev/null 2>&1; then
+    xz() { docker run --rm -i --user "$(id -u):$(id -g)" -v "${STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}":"${STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}" $([ "$PWD" != / ] && printf -- "-v %s:%s -w %s" "$PWD" "$PWD" "$PWD") nn-build:host-ci xz "$@"; }
+fi
+# NN_TOOLS_IN_CONTAINER=1 forces the container even where the host has the tool, so a
+# local run and the agent run use the same interpreter (build #1 came from that divergence)
+if [ "${NN_TOOLS_IN_CONTAINER:-0}" = 1 ] || ! command -v python3 >/dev/null 2>&1; then
+    python3() {
+        docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+            -v "${STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}":"${STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}" \
+            $([ "$PWD" != / ] && printf -- "-v %s:%s -w %s" "$PWD" "$PWD" "$PWD") ${NN_PY_EXTRA_MOUNTS:-} nn-build:host-ci python3 "$@"
+    }
+fi
+mkdir -p "$STAGE_ROOT"; WORK="$(mktemp -d -p "$STAGE_ROOT")"
+docker run --rm --network host --entrypoint sh \
+    -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+    -v "$WORK":/w minio/mc:latest \
+    -c "mc cp --recursive nn/$NN_MINIO_BUCKET/$SRC/ /w/ 2>&1" | grep -vE "Fetching" || true
+
+# assemble OTA-standard asset set
+REL="$WORK/release"; mkdir -p "$REL"
+# (each lookup may legitimately match nothing; under `set -eo pipefail` a
+#  failing `ls` inside $(...) would abort the script, so tolerate it)
+SIGNED="$(ls "$WORK"/*.signed.bin 2>/dev/null | head -1 || true)"
+[ -n "$SIGNED" ] || SIGNED="$(ls "$WORK"/*.bin 2>/dev/null | grep -vE 'ota_data|bootloader|partition' | head -1 || true)"
+# Whole-disk micro-SD card images (BeagleY-AI factory image) travel as
+# <name>.img.xz.  The hub's sources look for ONE fixed asset name,
+# image.signed.bin, whatever the format — the manifest's "format" field is
+# what tells the Factory it is an xz-compressed disk image, and
+# raw_size_bytes / raw_sha256 (of the DECOMPRESSED stream) are what the
+# flash helper verifies after writing the card.
+FORMAT="mcuboot"
+if [ -z "$SIGNED" ]; then
+    SIGNED="$(ls "$WORK"/*.img.xz 2>/dev/null | head -1 || true)"
+    [ -n "$SIGNED" ] && FORMAT="sdcard.img.xz"
+fi
+# A/B system-slot images (byai_system: one root filesystem with its kernel,
+# written by nn-sysupd into the idle slot) travel as <name>.rootfs.ext4.xz.
+if [ -z "$SIGNED" ]; then
+    SIGNED="$(ls "$WORK"/*.ext4.xz 2>/dev/null | head -1 || true)"
+    [ -n "$SIGNED" ] && FORMAT="rootfs.ext4.xz"
+fi
+# Layers that are a TARBALL, not an image: the trimmed TI container
+# (byai_platform, .tar.xz) and the camera app bundle (byai_camera, .tar.gz).
+# They install into a directory on nn-data rather than a partition, so they
+# have no raw/decompressed digest to gate on -- the byte sha256 below is the
+# whole contract, and the installers refuse a package that is not whole.
+if [ -z "$SIGNED" ]; then
+    SIGNED="$(ls "$WORK"/*.tar.xz 2>/dev/null | head -1 || true)"
+    [ -n "$SIGNED" ] && FORMAT="tar.xz"
+fi
+if [ -z "$SIGNED" ]; then
+    SIGNED="$(ls "$WORK"/*.tar.gz 2>/dev/null | head -1 || true)"
+    [ -n "$SIGNED" ] && FORMAT="tar.gz"
+fi
+[ -n "$SIGNED" ] || { echo "nn-release: no image bin / .img.xz / .ext4.xz / .tar.xz / .tar.gz in $SRC" >&2; exit 4; }
+cp "$SIGNED" "$REL/image.signed.bin"
+# per-artifact manifest beside the image (image build writes <artifact
+# basename>.manifest.json): its requires/kernel/git/boot_chain fields are
+# the agent's safety gates and must reach the hub manifest unchanged.
+AMAN=""
+for cand in "${SIGNED%.rootfs.ext4.xz}.manifest.json" "${SIGNED%.ext4.xz}.manifest.json" \
+            "${SIGNED%.img.xz}.manifest.json"; do
+    [ -f "$cand" ] && [ "$cand" != "$SIGNED" ] && { AMAN="$cand"; break; }
+done
+RAW_SIZE=0; RAW_SHA=""
+if [ "${FORMAT%.xz}" != "$FORMAT" ]; then
+    xz -t "$REL/image.signed.bin" || { echo "nn-release: $SIGNED is not a valid xz stream" >&2; exit 5; }
+    # one pass over the decompressed stream: byte count + sha256, nothing written to disk
+    read -r RAW_SHA RAW_SIZE < <(xz -dc "$REL/image.signed.bin" | python3 -c '
+import sys,hashlib
+h=hashlib.sha256(); n=0
+for chunk in iter(lambda: sys.stdin.buffer.read(1<<20), b""): h.update(chunk); n+=len(chunk)
+print(h.hexdigest(), n)')
+fi
+# GENERATE the OTA manifest the hub catalog parses (schema/device_type/
+# version/sha256/size_bytes/mcuboot) — NOT the build-metadata manifest.
+SUM="$(sha256sum "$REL/image.signed.bin" | cut -d' ' -f1)"
+SZ="$(stat -c %s "$REL/image.signed.bin")"
+BSHA="$(python3 -c "import json,sys;print(json.load(open('$WORK/manifest.json')).get('sha',''))" 2>/dev/null || true)"
+python3 - "$IMAGE" "$VERSION" "$SUM" "$SZ" "$SRC" "$BSHA" "$FORMAT" "$RAW_SIZE" "$RAW_SHA" "$AMAN" > "$REL/manifest.json" <<'PYEOF'
+import json, sys
+img, ver, sha, sz, src, bsha, fmt, raw_size, raw_sha, aman = sys.argv[1:11]
+m = {
+    "schema": 1,
+    "device_type": img,
+    "version": ver,
+    "sha256": sha,
+    "size_bytes": int(sz),
+    "mcuboot": {},
+    "build_meta": {"source": "minio:" + src, "build_sha": bsha},
+}
+if fmt != "mcuboot":
+    m["format"] = fmt
+if fmt.endswith(".xz"):
+    m["raw_size_bytes"] = int(raw_size)
+    m["raw_sha256"] = raw_sha
+if aman:
+    # gates and provenance from the build's own manifest, never invented here
+    a = json.load(open(aman))
+    for k in ("requires", "kernel", "git", "boot_chain"):
+        if k in a:
+            m[k] = a[k]
+    if a.get("version") and a["version"] != ver:
+        sys.exit("nn-release: %s says version %r, release asked for %r" % (aman, a["version"], ver))
+json.dump(m, sys.stdout, indent=1)
+PYEOF
+[ -n "$FLASH" ] && [ -f "$FLASH" ] && cp "$FLASH" "$REL/flash.sh"
+
+echo "── nn-release plan ────────────────────────────"
+echo "  image     : $IMAGE  (format $FORMAT)"
+echo "  version   : $VERSION"
+echo "  repo      : $REPO   (tag $VERSION)"
+echo "  from      : $NN_MINIO_BUCKET/$SRC"
+echo "  assets    :"; ( cd "$REL" && for f in *; do printf "      %-20s %s\n" "$f" "$(sha256sum "$f"|cut -c1-16)…"; done )
+
+if [ "$DRY" = 1 ]; then
+    echo "  manifest  :"; sed 's/^/      /' "$REL/manifest.json"
+    echo "── DRY-RUN: no GitHub release created, no upload. ─"
+    rm -rf "$WORK"; exit 0
+fi
+if [ -n "$LOCAL" ]; then
+    DEST="$LOCAL/$IMAGE/$VERSION"
+    mkdir -p "$DEST" && cp "$REL"/* "$DEST"/ || { echo "nn-release: cannot install into $DEST" >&2; rm -rf "$WORK"; exit 6; }
+    rm -rf "$WORK"
+    echo "nn-release: installed $IMAGE $VERSION into $DEST ($(ls "$DEST"|wc -l) assets; no GitHub release)"
+    exit 0
+fi
+
+: "${NN_RELEASE_GH_PAT:?live release needs NN_RELEASE_GH_PAT (repo/release scope)}"
+API="https://api.github.com/repos/$REPO"
+# create (or reuse) the release
+RID="$(curl -s -H "Authorization: token $NN_RELEASE_GH_PAT" "$API/releases/tags/$VERSION" \
+        | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)"
+if [ -z "$RID" ]; then
+    RID="$(curl -s -X POST -H "Authorization: token $NN_RELEASE_GH_PAT" "$API/releases" \
+        -d "{\"tag_name\":\"$VERSION\",\"name\":\"$IMAGE $VERSION\",\"body\":\"OTA release from MinIO $SRC\"}" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")"
+fi
+for f in "$REL"/*; do
+    name="$(basename "$f")"
+    curl -s -X POST -H "Authorization: token $NN_RELEASE_GH_PAT" \
+         -H "Content-Type: application/octet-stream" \
+         --data-binary @"$f" \
+         "https://uploads.github.com/repos/$REPO/releases/$RID/assets?name=$name" >/dev/null
+    echo "  uploaded  $name"
+done
+rm -rf "$WORK"
+echo "nn-release: $REPO release $VERSION published ($(ls "$REL"|wc -l) assets)"

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# nn-publish-vendor — put a versioned package into the MinIO artifact store's
+# vendor/ area, in exactly the layout nn-fetch-vendor reads back and verifies.
+#
+#   nn-publish-vendor <package> <file>...
+#   e.g. nn-publish-vendor nn-byai-toolchain-0123456789abcdef \
+#            _build/toolchain/nn-byai-toolchain-0123456789abcdef.tar.gz
+#
+# Layout:  nn-images/vendor/<package>/{<files>, manifest.json}
+# manifest.json = {"vendor":..,"package":..,"files":[{"name","size","sha256"},..]}
+#
+# A package is IMMUTABLE: publishing a name that already exists fails.  The
+# names carry a content key (nn-byai-toolchain-<key>), so letting a second
+# upload replace the first would let one key mean two different files.
+# The files go up first and the manifest last, so an interrupted upload
+# leaves no manifest and nn-fetch-vendor refuses it rather than trusting it.
+set -euo pipefail
+PKG="${1:?usage: nn-publish-vendor <package> <file>...}"; shift
+[ $# -gt 0 ] || { echo "nn-publish-vendor: no files given" >&2; exit 2; }
+ENVF="${NN_MINIO_ENV:-/media/chalos/mx500/nn-jenkins/minio.env}"
+# shellcheck disable=SC1090
+[ -f "$ENVF" ] && . "$ENVF"
+: "${NN_MINIO_ACCESS:?}" "${NN_MINIO_SECRET:?}"
+: "${NN_MINIO_ENDPOINT:=http://127.0.0.1:9000}" "${NN_MINIO_BUCKET:=nn-images}"
+STAGE_ROOT="${NN_MINIO_STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}"
+
+mkdir -p "$STAGE_ROOT"; W="$(mktemp -d -p "$STAGE_ROOT")"
+trap 'rm -rf "$W"' EXIT
+mkdir "$W/files"
+for f in "$@"; do
+    [ -f "$f" ] || { echo "nn-publish-vendor: not a file: $f" >&2; exit 2; }
+    cp "$f" "$W/files/"
+done
+
+# Plain shell on purpose: the Jenkins agent that runs this has no python3.
+{
+    printf '{"vendor":"nn","package":"%s","files":[' "$PKG"
+    sep=
+    for f in "$W"/files/*; do
+        printf '%s{"name":"%s","size":%s,"sha256":"%s"}' "$sep" "$(basename "$f")" \
+            "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+        sep=,
+    done
+    printf ']}\n'
+} > "$W/manifest.json"
+
+docker run --rm --network host --entrypoint sh \
+    -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+    -e P="nn/$NN_MINIO_BUCKET/vendor/$PKG" \
+    -v "$W":/w:ro minio/mc:latest -c '
+        if mc stat "$P/manifest.json" >/dev/null 2>&1; then
+            echo "nn-publish-vendor: $P already exists; packages are immutable" >&2; exit 3
+        fi
+        mc cp --recursive /w/files/ "$P/" >/dev/null
+        mc cp /w/manifest.json "$P/manifest.json" >/dev/null'
+echo "nn-publish-vendor: vendor/$PKG  ($(ls "$W/files" | wc -l) file(s) + manifest.json)"

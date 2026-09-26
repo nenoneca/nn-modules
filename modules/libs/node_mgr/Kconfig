@@ -1,0 +1,258 @@
+# SPDX-License-Identifier: Apache-2.0
+
+# Pull fw_common's Kconfig into scope so the `select FW_COMMON` below
+# resolves under apps that source only node_mgr/Kconfig.  fw_common/Kconfig
+# in turn rsources nn_osal/Kconfig, so NN_OSAL is visible too — sourcing
+# nn_osal directly from here would create a duplicate-choice warning.
+rsource "../fw_common/Kconfig"
+
+config NODE_MGR
+	bool "Node Manager library"
+	default y
+	depends on BT && OPENTHREAD
+	select FW_COMMON
+	help
+	  Reusable library for BLE+Thread provisioning, ECIES v2 hub crypto,
+	  mDNS-backed UDP messaging, DNS cache, and OTA firmware updates.
+	  Selects FW_COMMON because hub_crypto.c (the X25519+AES-GCM ECIES
+	  v2 implementation) now lives in modules/libs/fw_common/.
+
+if NODE_MGR
+
+# ── coap_log telemetry threshold (D2H LOG_LINE mesh traffic) ──────────────
+#
+# Every Zephyr LOG_*/NN_LOG_* call above this level gets forwarded to the
+# hub as an encrypted D2H LOG_LINE frame.  Lower thresholds slash mesh
+# traffic at the cost of less observability from the hub side; local UART
+# output is unaffected by this setting (the UART backend has its own
+# filter chain).
+
+config NODE_MGR_IMAGE_NAME
+	string "Firmware image identity (e.g. nn-app-mdns-ot-esp32c6)"
+	default ""
+	help
+	  The build-time identity of THIS firmware image.  One string, one
+	  source of truth: it is reported over the mesh (INFO_REPLY "img"),
+	  exposed over BLE during provisioning (FW_NAME characteristic
+	  e7f00007), and used by the hub as the OTA catalog key that decides
+	  which images this device is offered.  Set it in the app's
+	  prj.conf; leave empty only for apps that never OTA.
+
+config NODE_MGR_COAP_LOG_LEVEL
+	int "coap_log mesh-telemetry threshold (0=off 1=err 2=wrn 3=inf 4=dbg)"
+	default 2
+	range 0 4
+	help
+	  Default 2 (WRN) — warnings and errors cross the mesh; info and
+	  debug stay on UART only.  An explicit periodic heartbeat
+	  (NODE_MGR_HEARTBEAT_PERIOD_MS) keeps the hub's last_seen fresh
+	  independent of this setting.  0 disables hub-side log telemetry
+	  entirely.
+
+	  This was 3 (INF) and that made field ops throttle THEMSELVES.
+	  Every field read emits four INF lines (main "H2D received",
+	  coap_field "GET", field_relay "enqueued" + "acked"), and
+	  LOG_LINE is not in cmd_zero_sig(), so each one costs a ~1 s
+	  ECDSA signature on the C6.  Reads then queue behind the signing
+	  backlog: measured 67, 211, 95, 80, 1534, 1416 ms back-to-back on
+	  2026-08-22, against a device-reported mesh rtt of 77 ms.  Raise
+	  to 3 for a debugging session, not for normal running.
+
+config NODE_MGR_HEARTBEAT_PERIOD_MS
+	int "Period of the D2H DEVICE_HEARTBEAT frame (ms)"
+	default 30000
+	range 5000 600000
+	help
+	  Sensor sends a tiny D2H frame (cmd 0x0005, 4-byte uptime body)
+	  every N ms so the hub's last_seen liveness signal stays fresh
+	  even when no LOG_LINE / AUTO_EVENT telemetry is firing.  Defaults
+	  to 30 s — enough to surface dead sensors within 60-90 s on the
+	  dashboard, light enough to be lost in the mesh noise.
+
+# ── DNS cache ──────────────────────────────────────────────────────────────
+
+config NODE_MGR_DNS_CACHE_SIZE
+	int "DNS cache capacity (entries)"
+	default 4
+	range 1 32
+
+config NODE_MGR_DNS_CACHE_LRU
+	bool "LRU eviction for DNS cache"
+	default y
+
+config NODE_MGR_DNS_CACHE_TTL_SEC
+	int "DNS cache TTL (seconds, 0 = no expiry)"
+	default 60
+	range 0 3600
+
+# ── UDP messenger ──────────────────────────────────────────────────────────
+
+config NODE_MGR_MESSENGER_PORT
+	int "UDP port for mesh messages"
+	default 5000
+	range 1024 65535
+
+config NODE_MGR_MSG_MAX_LEN
+	int "Maximum message payload length (bytes)"
+	default 200
+	range 16 1024
+
+config NODE_MGR_RECV_STACK_SIZE
+	int "Receive thread stack size (bytes)"
+	default 2048
+
+# ── nn_proto client (D2H/D2G ↔ G2D/H2D via gateway over UDP) ─────────────
+
+config NODE_MGR_NN_PROTO_PORT
+	int "UDP port for nn_proto frames between device and gateway"
+	default 49190
+	range 1024 65535
+
+# ── Phase 6 hub<->device field-op relay ────────────────────────────────
+
+config NODE_MGR_FIELD_RELAY
+	bool "Hub<->device field-op H2D dispatcher"
+	default y
+	help
+	  Compile in field_relay_try_handle_h2d(), the standard handler for
+	  hub-initiated FIELD_OP requests received via the gateway.
+	  Decodes the inner-cmd frame, runs the shared field_op_dispatch
+	  (ECIES decrypt -> auto_engine set/get_field -> ECIES-encrypt the
+	  response), and sends back a FIELD_REPLY D2H frame on the same
+	  tid.  Apps delegate to this from their nn_proto_client on_h2d
+	  callback.
+
+config NODE_MGR_OTA_DELTA
+	bool "Binary-delta OTA via detools/heatshrink"
+	default y
+	help
+	  Compile in the device-side binary-delta apply path.  When the hub
+	  offers a patch in its OTA_CHECK reply (it can build one whenever
+	  the device's running image is cached), the device streams the
+	  detools patch via OTA_PATCH_REQ and reconstructs the target image
+	  in slot 1 from slot 0 + the patch — typically a ~30x smaller
+	  transfer than a full image for a code-change update.  Falls back
+	  to chunk-diff / full download when no patch is offered.
+
+config NODE_MGR_FIELD_RELAY_ENV_BUF
+	int "ECIES envelope working buffer (bytes)"
+	default 768
+	range 256 2048
+	depends on NODE_MGR_FIELD_RELAY
+	help
+	  Size of the on-stack inbound and outbound ECIES envelope
+	  buffers used inside the H2D handler.  Two buffers of this
+	  size live on the calling thread's stack while a FIELD_OP is
+	  being processed.
+
+# ── CoAP /info server ──────────────────────────────────────────────────────
+
+config NODE_MGR_COAP_PORT
+	int "CoAP server port"
+	default 5683
+	range 1 65535
+
+config NODE_MGR_COAP_STACK_SIZE
+	int "CoAP server thread stack size (bytes)"
+	default 4096
+	help
+	  Must be large enough for PSA crypto operations (AES-GCM, HKDF,
+	  ECDH) performed inside the CoAP /info handler.
+
+# ── On/off button input ─────────────────────────────────────────────────
+
+config NODE_MGR_BUTTON
+	bool "On/off button input"
+	depends on GPIO
+	help
+	  Generic GPIO button reader with debounce.  Reads a single pin
+	  via the `sw0` devicetree alias (declare via a board overlay).
+	  Pick exactly one behaviour: FLIP (momentary, mirrors GPIO) or
+	  TOGGLE (latched, flips on each press).  The button state is
+	  surfaced through auto_engine so it appears in /info caps and is
+	  readable through the Phase 6 field-relay path.
+
+if NODE_MGR_BUTTON
+
+config NODE_MGR_BUTTON_DEBOUNCE_MS
+	int "Debounce window (ms)"
+	default 30
+	range 1 500
+	help
+	  After any GPIO edge, the pin must read the same level for this
+	  long before the transition is reported.  Bouncy mechanical
+	  buttons usually settle within 5-20 ms; 30 ms is a safe default.
+
+choice
+	prompt "Button behaviour"
+	default NODE_MGR_BUTTON_FLIP
+
+config NODE_MGR_BUTTON_FLIP
+	bool "Flip — value mirrors GPIO (1 while held, 0 released)"
+
+config NODE_MGR_BUTTON_TOGGLE
+	bool "Toggle — value flips 0<->1 on each press"
+
+endchoice
+
+endif # NODE_MGR_BUTTON
+
+# ── Buttonless ROM-download trigger (chip-specific) ─────────────────────
+
+config NODE_MGR_DOWNLOAD_MODE
+	bool "Buttonless reboot-into-ROM-download command"
+	default y if SOC_SERIES_ESP32C6
+	help
+	  Compile a chip-specific helper + `download` shell command that
+	  forces the next boot into ROM download mode without a physical
+	  BOOT button.  Currently only ESP32-C6 is implemented (writes
+	  LP_AON_SYS_CFG_REG.FORCE_DOWNLOAD_BOOT then sys_reboot).
+
+config NODE_MGR_RADIO_STATS_PERIOD_MS
+	int "Period of the RADIO_STATS report to the hub (ms)"
+	default 300000
+	help
+	  Cumulative radio/mesh counters (driver tx outcomes, OpenThread MAC,
+	  IPv6 and MLE counters, parent link) sent unsigned and fire-and-forget
+	  so the hub can track channel health per device.
+
+config NODE_MGR_NN_PROTO_RELIABLE_FIRE_BURST
+	int "Copies sent per reliable-send attempt"
+	default 3
+	range 1 5
+	help
+	  Each attempt of a reliable message is sent this many times,
+	  NODE_MGR_NN_PROTO_RELIABLE_FIRE_GAP_MS apart.  3 compensated for a
+	  radio that never retried a lost frame.  On 802.15.4 with a driver
+	  that reports tx failures (OpenThread then retries each frame), use
+	  1: extra copies only add air time and CCA-busy on a shared channel.
+
+config NODE_MGR_NN_PROTO_RELIABLE_FIRE_GAP_MS
+	int "Gap between the copies of one attempt (ms)"
+	default 30
+
+endif # NODE_MGR
+
+# PSA algorithm dependencies for hub_crypto ECIES v2 (X25519 + HKDF + AES-GCM).
+# PSA_WANT_* symbols are invisible when MBEDTLS_PROMPTLESS=y and cannot be set
+# from prj.conf; they must be pulled in via 'select' from an enabled symbol.
+config NODE_MGR_HUB_CRYPTO_DEPS
+	bool
+	default y if NODE_MGR
+	# X25519 ECDH for hub_crypto ECIES v2 (encryption).
+	select PSA_WANT_ALG_ECDH
+	select PSA_WANT_ALG_HKDF
+	select PSA_WANT_ALG_SHA_256
+	select PSA_WANT_ALG_GCM
+	select PSA_WANT_ECC_MONTGOMERY_255
+	# P-256 ECDSA + RFC 6979 deterministic-k for nn_proto signatures.
+	# Pulled in here too because nn_proto_client.c ships in node_mgr.
+	select PSA_WANT_ECC_SECP_R1_256
+	select PSA_WANT_ALG_ECDSA
+	select PSA_WANT_ALG_DETERMINISTIC_ECDSA
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_BASIC
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_IMPORT
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_EXPORT
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_GENERATE
+	select PSA_WANT_KEY_TYPE_ECC_PUBLIC_KEY
+	select PSA_WANT_KEY_TYPE_DERIVE

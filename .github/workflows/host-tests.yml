@@ -1,0 +1,32 @@
+# Host-compiled C test suites — run both natively (fast signal) and
+# inside the nn-build container (the same environment as the dev box
+# and, later, Jenkins).  On-target behavior stays with the bench E2E.
+name: host-tests
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-c:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run all host suites (native)
+        run: modules/tests/run_host_tests.sh
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build nn-build:host-ci (layer-cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: docker
+          target: host-ci
+          tags: nn-build:host-ci
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Run all host suites (in container)
+        run: scripts/nnbuild host-tests

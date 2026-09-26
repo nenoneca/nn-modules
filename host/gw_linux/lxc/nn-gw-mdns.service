@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Host-side mDNS publisher for the gw_linux container.
+#
+# The container runs gw_linux with --no-mdns to avoid spawning a
+# second avahi-daemon on the same network namespace as the host
+# (which causes hostname-conflict retries on every restart).  Instead
+# this unit runs the publish step ON THE HOST, with the instance name
+# read out of the gateway's persisted identity file at
+# /var/lib/nn-gw/kv/gw_identity/p256_priv (truncated to the same
+# nn-gw-XXXXXX form gw_linux's internal naming uses).
+#
+# Place at /etc/systemd/system/nn-gw-mdns.service and enable.
+
+[Unit]
+Description=mDNS publisher for the nn-gw LXC gateway
+After=avahi-daemon.service nn-gw.service network-online.target
+Wants=avahi-daemon.service network-online.target
+Requires=avahi-daemon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nn-gw-mdns-publish
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

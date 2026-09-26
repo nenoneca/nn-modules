@@ -1,0 +1,39 @@
+# AMB82-mini — Realtek's own RTL8735BDM board, with the JXF37 (F37) 1080p
+# sensor that every public AmebaPro2 tree supports.
+#
+# A STAND-IN for hub8735, chosen 2026-09-13 so the camera path can be proven
+# while the PS5268 sensor binaries are sorted out with the vendor.  Same SoC
+# family, same backends, same toolchain -- the build keys come from hub8735 via
+# "extends" so the two cannot drift.
+#
+# It is a SEPARATE declaration on purpose, and this is the rule that makes the
+# stand-in safe to use: a result earned on this board is recorded as an
+# amb82mini result, never as a hub8735 one.  The conformance matrix must not
+# show hub8735 green on the strength of a different sensor, a different
+# carrier board and a different power supply.  Everything above the sensor
+# seam transfers; the sensor itself, and anything that depends on the module's
+# own board (antenna, power, thermal), has to be re-proven on hub8735.
+platform: amb82mini
+extends: hub8735
+description: >
+  Realtek AMB82-mini (RTL8735BDM) with JXF37 sensor.  Stand-in for hub8735
+  while PS5268 binaries are pending.
+
+board:
+  sensor: JXF37 (SENSOR_F37) — sensor_f37.bin + iq_f37.bin ship in the SDK
+  sensor_note: >
+    The only sensor whose driver and IQ binaries are in any public tree, which
+    is exactly why this board unblocks T3 capture and T4 today.
+
+what_transfers_to_hub8735:
+  - T0 — identical backends and build; a pass here is a pass there
+  - T1 — OSAL on the same SoC and RTOS
+  - T2 BLE — same radio block and stack; RE-CHECK on hub8735 for antenna/RF
+  - T2 Wi-Fi — same; RE-CHECK throughput and coex on the module's own antenna
+  - T3 inference — same NPU, same yolov7_tiny.nb
+  - T3 capture, encode — the pipeline code transfers; the SENSOR does not
+
+what_does_not:
+  - T3 "first frame after a cold boot, unattended" — sensor-specific by nature
+  - T3 exposure control — IQ tuning is per sensor
+  - anything measured against power or thermal behaviour

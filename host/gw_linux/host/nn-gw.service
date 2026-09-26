@@ -1,0 +1,28 @@
+# nn-gw on the OPi HOST (no LXC) — supervises gw_linux against the USB NCP.
+# Same lifecycle as the LXC variant: provision-net until the six-file
+# blob is complete, then operate; Restart=always bridges the post-COMMIT
+# _exit(0).
+[Unit]
+Description=nn gateway daemon (USB NCP on ttyACM, OPi host)
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/gw-supervise
+Restart=always
+RestartSec=1
+# gw_linux pings the watchdog while its main loop runs; a frozen or hung
+# gateway is restarted (its NCP would otherwise keep acting as the border
+# router and swallow the uplink of every sensor behind it).
+WatchdogSec=45
+NotifyAccess=main
+User=root
+Environment=HOME=/root
+# Hub runs on this same host and owns :8770 — gateway provisions on 8771.
+EnvironmentFile=-/etc/nn-gw.env
+NoNewPrivileges=true
+ProtectHome=false
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,288 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# nn_registry — single source of truth that maps an *application identity*
+# (nn-app-xx) onto the set of subsystems that app is allowed to build.
+#
+# An app declares WHO it is via one line in its sdkconfig.defaults
+# (e.g. CONFIG_NN_APP_MEDIA=y).  Everything else — the SDIO link role and
+# the wifi/ble/openthread feature gates — is *derived* here so no app can
+# accidentally pull in a subsystem it is supposed to exclude.  Component
+# CMakeLists and C code then key off CONFIG_NN_FEATURE_* / CONFIG_NN_LINK_ROLE_*.
+
+menu "NN application registry"
+
+choice NN_APP
+	prompt "NN application identity"
+	default NN_APP_NONE
+	help
+	  Pick which nn-app-xx this firmware is.  Set from the app's
+	  sdkconfig.defaults; the feature matrix below is derived from it.
+
+config NN_APP_NONE
+	bool "(none / generic)"
+
+config NN_APP_MEDIA
+	bool "media — ESP32-P4 camera host (media-1)"
+	help
+	  The P4 application brain of the camera system.  No radio of its
+	  own: wifi, ble and openthread are all excluded.  Talks to the C6
+	  networking co-processor over SDIO (SDIO bus master).
+
+config NN_APP_MEDIA_NETWORK
+	bool "media-network — ESP32-C6 networking co-processor (media-network-1)"
+	help
+	  The C6 networking chip (NCP-Host style): owns wifi + ble, drives
+	  the P4's boot/reset, and is the SDIO bus slave.  OpenThread is
+	  explicitly excluded for this system.
+
+endchoice
+
+# ── Derived: SDIO link role ─────────────────────────────────────────────
+config NN_LINK_ROLE_MASTER
+	bool
+	default y if NN_APP_MEDIA
+	help
+	  This node is the SDIO bus master (SDMMC host).  The P4 initiates
+	  the SDIO connection to the C6 slave.
+
+config NN_LINK_ROLE_SLAVE
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	help
+	  This node is the SDIO bus slave.  The C6 waits passively for the
+	  P4 master to enumerate and establish the link.
+
+# ── Derived: radio / subsystem feature matrix ───────────────────────────
+config NN_FEATURE_WIFI
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	default y if NN_APP_MEDIA
+	help
+	  Wi-Fi is owned by the C6 networking co-processor (media-network) or,
+	  after the esp-hosted migration, by the P4 host (media) which drives the
+	  C6 radio remotely over esp-hosted.
+
+config NN_FEATURE_BLE
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	default y if NN_APP_MEDIA
+	help
+	  BLE provisioning.  On the legacy C6 media-network it ran on the C6's own
+	  NimBLE stack; after the esp-hosted migration it runs on the P4 host as a
+	  NimBLE HOST over the C6's BT controller (HCI-over-esp-hosted / VHCI).
+
+config NN_FEATURE_OPENTHREAD
+	bool
+	default n
+	help
+	  OpenThread is excluded from the whole media camera system.  The
+	  C6 here reaches the hub / video-stream server over Wi-Fi, not
+	  Thread, so neither app enables 802.15.4.
+
+# ── Link transport: SDIO (SD bus) vs SPI (spi_slave_hd) ─────────────────
+choice NN_LINK_TRANSPORT
+	prompt "P4<->C6 link transport"
+	default NN_LINK_TRANSPORT_SPI
+	help
+	  Which physical link the P4 master and C6 slave use.
+
+	  SPI (default): essl_spi host (P4) <-> spi_slave_hd segment mode (C6).
+	  Push-pull, GPIO-matrix routable, robust over jumper wires and not
+	  pull-up sensitive — the right choice for bench bring-up.
+
+	  SDIO: SDMMC host (P4) <-> SDIO slave (C6).  Higher bandwidth (4-bit),
+	  but an open-drain bus that REQUIRES external pull-ups on CMD/D0..D3 —
+	  best on a real PCB.
+
+config NN_LINK_TRANSPORT_SPI
+	bool "SPI (spi_slave_hd + essl_spi)"
+
+config NN_LINK_TRANSPORT_SDIO
+	bool "SDIO (SD bus, 4-bit)"
+
+endchoice
+
+# Quad-data SPI: 4 data lines (IO0..IO3) instead of single MOSI/MISO, ~4x the
+# data-phase throughput.  Reuses the same harness — the handshake (D1) and the
+# spare (D2) wires become IO2/IO3 — so the handshake GPIO is unavailable and
+# the master falls back to register polling.
+config NN_LINK_SPI_QUAD
+	bool "SPI: use quad data lines (IO0..IO3)"
+	default n
+	depends on NN_LINK_TRANSPORT_SPI
+
+# Dual (2-bit) data phase over IO0+IO1 only (the two wires proven good in
+# single-line).  ~2x single-line throughput; avoids the IO2/IO3 + quad-protocol
+# path that failed.  Mutually exclusive with quad.
+config NN_LINK_SPI_DUAL
+	bool "SPI: use dual data lines (IO0+IO1, 2-bit)"
+	default n
+	depends on NN_LINK_TRANSPORT_SPI && !NN_LINK_SPI_QUAD
+
+# Use a slave->master handshake GPIO (D1 line) for low-latency data-ready
+# signalling instead of pure register polling.  Not available in quad mode
+# (the D1 wire is repurposed as a data line).
+config NN_LINK_SPI_HANDSHAKE
+	bool "SPI: use slave->master handshake GPIO (D1)"
+	default y
+	depends on NN_LINK_TRANSPORT_SPI && !NN_LINK_SPI_QUAD
+
+# Diagnostic: in single-line mode, route the master->slave data line (MOSI)
+# over a chosen physical quad data wire to find a bad/unstable line.
+#   0 = IO0/MOSI (normal, GPIO C6 18 / P4 3)
+#   1 = IO1/MISO wire (C6 20 / P4 15)
+#   2 = IO2/WP   wire (C6 21 / P4 16)
+#   3 = IO3/HD   wire (C6 22 / P4 17)
+# If the link connects + video flows over wire N, that wire is good.
+config NN_LINK_DIAG_MOSI
+	int "SPI diag: master->slave data wire (0=IO0,1=IO1,2=IO2,3=IO3)"
+	default 0
+	depends on NN_LINK_TRANSPORT_SPI && !NN_LINK_SPI_QUAD
+
+# ── Hardware board / wiring profile ──────────────────────────────────────
+# The P4<->C6 interconnect pins depend on the physical board, NOT on the app
+# logic.  A board profile bundles that pin map so a per-variant app (e.g.
+# nn-app-camera-esp32p4c6-sdio-imx708 vs ...-esp32p4module-...) selects ONE
+# option instead of overriding every pin.  To add a board: add an option to the
+# choice, then prepend `default <pin> if NN_BOARD_<X>` to each pin below.
+choice NN_BOARD
+	prompt "Hardware board / wiring profile"
+	default NN_BOARD_P4C6_COMBO
+	help
+	  Selects default GPIO assignments for the P4<->C6 link (SPI/SDIO) and
+	  the P4 BOOT/RESET straps.  CUSTOM leaves them at the reference-board
+	  defaults but is the marker that the app's sdkconfig.defaults overrides
+	  the pins for bespoke wiring.
+
+config NN_BOARD_P4C6_COMBO
+	bool "ESP32-P4 + C6 combo bench harness (media-1 reference)"
+
+config NN_BOARD_CUSTOM
+	bool "Custom wiring (pins set per-app in sdkconfig.defaults)"
+
+endchoice
+
+# ── P4<->C6 SPI link pins ────────────────────────────────────────────────
+# Defined unconditionally (referenced directly by the SPI backend source); the
+# SPI source only compiles when NN_LINK_TRANSPORT_SPI, so unused on SDIO builds.
+# C6 = slave side, P4 = master side (each target's backend uses its own set).
+config NN_LINK_SPI_C6_SCLK
+	int "SPI SCLK GPIO (C6 slave)"
+	default 19
+config NN_LINK_SPI_C6_MOSI
+	int "SPI MOSI/IO0 GPIO (C6 slave)"
+	default 18
+config NN_LINK_SPI_C6_MISO
+	int "SPI MISO/IO1 GPIO (C6 slave)"
+	default 20
+config NN_LINK_SPI_C6_CS
+	int "SPI CS GPIO (C6 slave)"
+	default 23
+config NN_LINK_SPI_C6_HS
+	int "SPI handshake/IO2 GPIO (C6 slave)"
+	default 21
+config NN_LINK_SPI_C6_HD
+	int "SPI IO3 GPIO (C6 slave, quad only)"
+	default 22
+config NN_LINK_SPI_P4_SCLK
+	int "SPI SCLK GPIO (P4 master)"
+	default 2
+config NN_LINK_SPI_P4_MOSI
+	int "SPI MOSI/IO0 GPIO (P4 master)"
+	default 3
+config NN_LINK_SPI_P4_MISO
+	int "SPI MISO/IO1 GPIO (P4 master)"
+	default 15
+config NN_LINK_SPI_P4_CS
+	int "SPI CS GPIO (P4 master)"
+	default 18
+config NN_LINK_SPI_P4_HS
+	int "SPI handshake/IO2 GPIO (P4 master)"
+	default 16
+config NN_LINK_SPI_P4_HD
+	int "SPI IO3 GPIO (P4 master, quad only)"
+	default 17
+
+# ── P4<->C6 SDIO link pins (P4 master side; C6 slave pins are SoC-fixed) ──
+config NN_LINK_SDIO_CLK
+	int "SDIO CLK GPIO (P4 master)"
+	default 2
+config NN_LINK_SDIO_CMD
+	int "SDIO CMD GPIO (P4 master)"
+	default 3
+config NN_LINK_SDIO_D0
+	int "SDIO D0 GPIO (P4 master)"
+	default 15
+config NN_LINK_SDIO_D1
+	int "SDIO D1 GPIO (P4 master)"
+	default 16
+config NN_LINK_SDIO_D2
+	int "SDIO D2 GPIO (P4 master)"
+	default 17
+config NN_LINK_SDIO_D3
+	int "SDIO D3 GPIO (P4 master)"
+	default 18
+
+# ── Derived: companion-chip control ─────────────────────────────────────
+config NN_FEATURE_P4CTL
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	help
+	  The C6 owns the P4's BOOT and RESET straps (it can power-cycle the
+	  P4 and force it into ROM-download mode).
+
+# P4 BOOT/RESET straps are C6 GPIOs — board wiring, so configurable.
+config NN_P4CTL_PIN_BOOT
+	int "P4 BOOT strap GPIO (driven by the C6)"
+	default 6
+config NN_P4CTL_PIN_RESET
+	int "P4 EN/RESET GPIO (driven by the C6)"
+	default 5
+
+# ── nn_ctrl coupling: which C6-only deps the control channel pulls in ────
+# nn_ctrl runs on both the C6 media-network and the esp-hosted P4 host.  On the
+# C6 it reads the hub key/endpoint from nn_prov and dispatches OTA to nn_ota_c6.
+# On the P4 host neither applies (hub config via nn_ctrl_set_hub; OTA is the
+# P4's own).  These derive y only for the C6 app so the P4 build stays lean.
+config NN_CTRL_HAS_PROV
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	help
+	  nn_ctrl sources the hub key/endpoint from nn_prov (C6).  Off on the P4
+	  host, which calls nn_ctrl_set_hub() instead.
+config NN_CTRL_HAS_OTA
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	help
+	  nn_ctrl dispatches OTA opcodes to nn_ota_c6 (C6).  Off on the P4 host.
+
+config NN_TIMESYNC_HAS_LINK
+	bool
+	default y if NN_APP_MEDIA_NETWORK
+	help
+	  nn_timesync runs the P4<->C6 clock-offset sub-protocol over nn_link (C6).
+	  Off on the esp-hosted P4 host, which owns the absolute clock directly.
+
+# ── Fallback hub control endpoint ────────────────────────────────────────
+# nn_ctrl dials the provisioned hub_host:hub_port.  If provisioning left the
+# CONTROL endpoint empty (only the stream endpoint set), the control channel —
+# and thus registration / logging / config-sync / OTA — is dead.  A non-empty
+# fallback here lets a mis-/under-provisioned device still reach a known hub
+# (it already holds the hub pubkey).  Empty = no fallback (strict provisioning).
+config NN_CTRL_DEFAULT_HUB_HOST
+	string "Fallback hub control host (empty = require provisioning)"
+	default ""
+config NN_CTRL_DEFAULT_HUB_PORT
+	int "Fallback hub control port"
+	default 8772
+
+# ── Derived: camera (MIPI-CSI capture + hardware H.264) ─────────────────
+config NN_FEATURE_CAMERA
+	bool
+	default y if NN_APP_MEDIA
+	help
+	  The P4 owns the MIPI-CSI camera: sensor (selected via CONFIG_CAMERA_*,
+	  e.g. IMX708) -> CSI -> ISP -> hardware H.264 encoder.  Only the P4
+	  (media) has the CSI/ISP/H264 peripherals.
+
+endmenu

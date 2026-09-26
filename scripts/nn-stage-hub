@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# nn-stage-hub — put a MinIO build into the bench hub's LocalDirSource and
+# (optionally) promote it, so a device pulls it on its next tick.
+#
+#   nn-stage-hub <image> <version> [--build <build-id>] [--pipeline <job>]
+#                [--flash <flash.sh>] [--promote]
+#   --flash: ship the app's flash.sh too (Factory "Flash a device" runs it)
+#
+# = nn-release --local into a temp dir → scp to $HUB_SSH:~/.nn-hub/firmware-local/
+#   <image>/<version>/ → POST /firmware/sources/<source>/sync → [POST .../promote].
+#
+# Hosts and credentials come from the ENVIRONMENT only (never literals here):
+#   ~/.config/nn/release.env  (0600)  exporting HUB, HUB_SSH, HUB_PASS
+#   optional: NN_HUB_SOURCE (default bench-local), NN_HUB_FW_DIR
+#   (default ~/.nn-hub/firmware-local on the hub host).  Override the env
+#   file with NN_RELEASE_ENV.  MinIO creds as for nn-release.
+set -euo pipefail
+IMAGE="${1:?usage: nn-stage-hub <image> <version> [--build id] [--pipeline job] [--promote]}"
+VERSION="${2:?version required}"; shift 2
+PROMOTE=0; PASS=()
+while [ $# -gt 0 ]; do case "$1" in
+  --promote) PROMOTE=1; shift;;
+  --build|--pipeline|--flash) PASS+=("$1" "$2"); shift 2;;
+  *) echo "nn-stage-hub: unknown arg $1" >&2; exit 2;;
+esac; done
+_env_file=${NN_RELEASE_ENV:-$HOME/.config/nn/release.env}
+# shellcheck source=/dev/null
+[ -r "$_env_file" ] && . "$_env_file"
+for v in HUB HUB_SSH HUB_PASS; do
+    [ -n "${!v:-}" ] || { echo "nn-stage-hub: \$$v is not set — put it in $_env_file (0600)" >&2; exit 2; }
+done
+SOURCE="${NN_HUB_SOURCE:-bench-local}"
+FWDIR="${NN_HUB_FW_DIR:-.nn-hub/firmware-local}"        # relative to the hub user's home
+API="http://$HUB:8769/api/v1"
+HERE="$(cd "$(dirname "$0")" && pwd)"
+STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
+
+"$HERE/nn-release" "$IMAGE" "$VERSION" "${PASS[@]}" --local "$STAGE"
+SRC="$STAGE/$IMAGE/$VERSION"
+[ -f "$SRC/image.signed.bin" ] && [ -f "$SRC/manifest.json" ] || { echo "nn-stage-hub: nn-release produced no asset set" >&2; exit 3; }
+
+sshpass -p "$HUB_PASS" ssh -o StrictHostKeyChecking=no "$HUB_SSH" "mkdir -p '$FWDIR/$IMAGE/$VERSION'"
+sshpass -p "$HUB_PASS" scp -q -o StrictHostKeyChecking=no "$SRC"/* "$HUB_SSH:$FWDIR/$IMAGE/$VERSION/"
+# the hub verifies the copy against the manifest on sync; compare bytes here too
+want=$(sha256sum "$SRC/image.signed.bin" | cut -d' ' -f1)
+have=$(sshpass -p "$HUB_PASS" ssh -o StrictHostKeyChecking=no "$HUB_SSH" "sha256sum '$FWDIR/$IMAGE/$VERSION/image.signed.bin' | cut -d' ' -f1")
+[ "$want" = "$have" ] || { echo "nn-stage-hub: copy on the hub does not match (want $want, have $have)" >&2; exit 4; }
+
+curl -sf -m 120 -X POST "$API/firmware/sources/$SOURCE/sync" >/dev/null || { echo "nn-stage-hub: sync of source $SOURCE failed" >&2; exit 5; }
+curl -sf -m 15 "$API/firmware/catalog?device_type=$IMAGE" | grep -q "\"version\": *\"$VERSION\"" || {
+    echo "nn-stage-hub: $IMAGE $VERSION is not in the catalog after sync" >&2; exit 5; }
+echo "nn-stage-hub: $IMAGE $VERSION staged in $SOURCE (sha ${want:0:12}…)"
+if [ "$PROMOTE" = 1 ]; then
+    curl -sf -m 60 -X POST "$API/firmware/catalog/$IMAGE/$VERSION/promote" -H 'Content-Type: application/json' -d '{}' >/dev/null \
+        || { echo "nn-stage-hub: promote failed" >&2; exit 7; }
+    echo "nn-stage-hub: $IMAGE $VERSION PROMOTED — devices of type $IMAGE pull it on their next tick"
+fi

@@ -1,0 +1,22 @@
+[Unit]
+Description=nn whole-system A/B slot updater (one step)
+Documentation=file:/usr/share/doc/nn-sysupd/README.md
+# state (pending/blocked) and the provisioning KV live on nn-data
+RequiresMountsFor=/var/lib/nn-ota /var/lib/nn
+After=network-online.target nn-setupd.service
+Wants=network-online.target
+# never run alongside the bundle/platform agent's swap
+Conflicts=nn-ota.service
+
+[Service]
+Type=oneshot
+# /run/nn-sysupd: lock + slot mount point, gone on every boot by construction
+RuntimeDirectory=nn-sysupd
+RuntimeDirectoryPreserve=yes
+ExecStart=/usr/sbin/nn-sysupd
+# the run may stream a full root filesystem to the card
+TimeoutStartSec=2h
+Nice=19
+IOSchedulingClass=idle
+StandardOutput=journal
+StandardError=journal

@@ -1,0 +1,142 @@
+# SPDX-License-Identifier: Apache-2.0
+menu "nn_camera (MIPI-CSI + hardware H.264)"
+	depends on NN_FEATURE_CAMERA
+
+config NN_CAMERA_SCCB_SCL_IO
+	int "Camera SCCB (I2C) SCL GPIO"
+	default 8
+
+config NN_CAMERA_SCCB_SDA_IO
+	int "Camera SCCB (I2C) SDA GPIO"
+	default 7
+
+# The active sensor + its MIPI mode/lane-rate/RAW format are selected by the
+# esp_cam_sensor driver (CONFIG_CAMERA_<SENSOR>_MIPI_*), which owns bring-up.
+# nn_camera only needs the negotiated capture geometry below.
+
+config NN_CAMERA_HRES
+	int "Encoder output width (pixels, multiple of 16)"
+	default 1280
+	help
+	  The H.264 stream width.  If it differs from NN_CAMERA_CAP_HRES the frame
+	  is HW-downscaled by the PPA (the ISP has no scaler).  The P4 H.264
+	  encoder tops out at 1920 wide.
+
+config NN_CAMERA_VRES
+	int "Encoder output height (pixels, multiple of 16)"
+	default 720
+
+config NN_CAMERA_CROP_X_OFFSET
+	int "PPA crop x-offset when CAP_HRES > HRES (-1 = centred)"
+	default -1
+	help
+	  Where the encoder's HRES-wide window sits inside the CAP_HRES-wide
+	  capture when the 1:1 PPA crop path is active.  Set to the full margin
+	  (CAP_HRES - HRES) to discard ONLY left columns — used to drop the
+	  sensor/ISP line-start chroma artifact (purple left band).  -1 keeps the
+	  historic centred crop.  Even values only (YUV420).
+
+config NN_CAMERA_CAP_HRES
+	int "Sensor/ISP capture width (pixels)"
+	default NN_CAMERA_HRES
+	help
+	  Must match the sensor mode selected under esp_cam_sensor
+	  (CONFIG_CAMERA_<SENSOR>_MIPI_*).  nn_camera logs the sensor's offered
+	  formats at init.  When larger than NN_CAMERA_HRES the captured frame is
+	  PPA-downscaled to the encoder size (preserving full field of view — a
+	  scale, not a crop).  Defaults to the encoder size => no scaling.
+
+config NN_CAMERA_CAP_VRES
+	int "Sensor/ISP capture height (pixels)"
+	default NN_CAMERA_VRES
+
+config NN_CAMERA_DIAG_ISP
+	bool "ISP diagnostic mode (send raw RGB frames, no H.264)"
+	default n
+	help
+	  Diagnostic firmware: capture raw RGB888 frames at the sensor resolution
+	  with the normal ISP settings and push them (+ timestamp + settings) to the
+	  media service's /diag/isp WebSocket, instead of encoding H.264.  Lets the
+	  host see the true ISP output geometry/colour, bypassing PPA + encoder.
+
+config NN_CAMERA_DIAG_HOST
+	string "Diag media-service host (IPv4 or hostname)"
+	default ""
+	depends on NN_CAMERA_DIAG_ISP
+	help
+	  Where the diag frames go.  No default: set it in the build's own
+	  sdkconfig (e.g. an uncommitted sdkconfig.defaults.local).  Empty =
+	  capture runs, nothing is pushed.
+
+config NN_CAMERA_DIAG_PORT
+	int "Diag media-service port"
+	default 8899
+	depends on NN_CAMERA_DIAG_ISP
+
+config NN_CAMERA_DIAG_INTERVAL_MS
+	int "Diag capture interval (ms)"
+	default 15000
+	depends on NN_CAMERA_DIAG_ISP
+
+config NN_CAMERA_DIAG_NAME
+	string "Diag camera device name"
+	default "p4cam"
+	depends on NN_CAMERA_DIAG_ISP
+
+config NN_CAMERA_H264_FPS
+	int "H.264 target frame rate"
+	default 30
+
+config NN_CAMERA_H264_GOP
+	int "H.264 GOP size (keyframe interval, frames)"
+	default 30
+
+config NN_CAMERA_H264_BITRATE
+	int "H.264 target bitrate (bits/sec)"
+	default 2000000
+	help
+	  ~2 Mbit/s (0.25 MB/s) suits 720p streaming over the C6 link.
+
+config NN_CAMERA_H264_MIN_QP
+	int "H.264 minimum quantiser (lower = crisper when bitrate permits)"
+	default 20
+
+config NN_CAMERA_H264_MAX_QP
+	int "H.264 maximum quantiser (higher = holds bitrate under motion)"
+	default 46
+
+config NN_CAMERA_LDO_CHAN
+	int "LDO channel powering the MIPI CSI/DSI PHY"
+	default 3
+
+config NN_CAMERA_LDO_MV
+	int "MIPI PHY LDO voltage (mV)"
+	default 2500
+
+config NN_CAMERA_XCLK_PIN
+	int "Generate sensor XVCLK (24MHz) on this GPIO (-1 = module self-clocks)"
+	default -1
+
+config NN_CAMERA_FOCUS_MAX
+	int "VCM focus range maximum (0..MAX; DW9714-class = 1023)"
+	default 1023
+	help
+	  Upper bound for nn_camera_set_focus().  Depends on the lens/VCM motor
+	  (a 10-bit DW9714 is 0..1023).
+
+# Raising red+blue together (vs the sensor's dominant green channel) is what
+# neutralises the IMX708 green cast; r=b=1620 removes it without magenta overshoot
+# (validated by runtime CCM A/B sweep 2026-07-16, variant "F").
+config NN_CAMERA_WB_R_MILLI
+	int "Default white-balance red gain (milli, CCM diagonal)"
+	default 1620
+
+config NN_CAMERA_WB_B_MILLI
+	int "Default white-balance blue gain (milli, CCM diagonal)"
+	default 1620
+
+config NN_CAMERA_RAW_DIAG
+	bool "Diagnostic: capture RAW8 (bypass ISP + H.264)"
+	default n
+
+endmenu

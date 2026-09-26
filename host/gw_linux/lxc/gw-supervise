@@ -1,0 +1,38 @@
+#!/bin/sh
+# gw-supervise — pick the gw_linux mode from the persisted provision state.
+#
+# Runs under a Restart=always unit: gw_linux exits after a successful
+# provision COMMIT, and the restart is what flips it into operate mode.
+#
+# Env (from the unit or its EnvironmentFile):
+#   STATE_DIR      kvstore root, the SAME value the binary gets as
+#                  NN_GW_STATE_DIR (two names for one directory -- learned
+#                  the hard way when they disagreed and the gateway stayed
+#                  "not yet provisioned" forever)
+#   NCP_UART       "auto" (default) probes /dev/serial/by-id/*Espressif* and
+#                  the ttyAMA/ttyACM candidates with a Spinel NOOP; or a
+#                  fixed /dev/... .  Line settings: NCP_UART_FLOW / _BAUD.
+#   GW_PROV_PORT   provisioning listener port; needed when the hub shares
+#                  the host (its own gateway listener owns 8770)
+#   GW_LINUX       the binary, when it is not on PATH
+#
+# POSIX sh on purpose: the Buildroot camera image has no bash.
+set -u
+STATE="${STATE_DIR:-/root/.local/state/nn-gw}/kv/gw_provision"
+UART="${NCP_UART:-auto}"
+BIN="${GW_LINUX:-$(command -v gw_linux || echo /usr/local/bin/gw_linux)}"
+
+# Six files = full set written by gw_provision_set.
+complete=1
+for f in ssid psk hub_mdns hub_id hub_pub ot_dataset; do
+    [ -s "$STATE/$f" ] || { complete=0; break; }
+done
+
+if [ "$complete" = 1 ]; then
+    echo "[supervise] provisioning complete -> operate $UART"
+    exec "$BIN" operate "$UART"
+fi
+PROV_PORT="${GW_PROV_PORT:-}"
+echo "[supervise] not yet provisioned -> provision-net ${PROV_PORT} --no-mdns"
+# shellcheck disable=SC2086  # PROV_PORT is deliberately unquoted: empty = default
+exec "$BIN" provision-net $PROV_PORT --no-mdns

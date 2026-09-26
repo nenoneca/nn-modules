@@ -1,0 +1,88 @@
+# T1 · watchdog cases.  Same record shape as the rest of cts/cases/.
+
+cases:
+
+  - id:       T1-WDOG-02
+    contract: |
+      A kernel panic, or a hang that stops the scheduler, returns the board to
+      service without a person -- the watchdog the system pets is one that can
+      survive the failure it is there for.
+    level:    must
+    peers:    console capture from the bench (no network after the panic)
+    setup:    booted board, disk synced, console listener armed
+    stimulus: |
+      Trigger a panic (Linux: echo c > /proc/sysrq-trigger).  Run last in a
+      session: it is deliberately destructive.
+    pass: |
+      The board is back at its login prompt, still provisioned, in under
+      3 minutes with no hands.  Also record WHICH watchdog device the system
+      pets: a software watchdog cannot pass this case, whatever else is true.
+    evidence: |
+      Console from the panic to the next first-stage boot banner, with
+      timestamps; the watchdog identity list captured before the panic.
+    seen: |
+      BeagleY-AI, 2026-09-14 (E2E run 1).  softdog was built in, registered
+      first as watchdog0, and systemd petted it while all five K3 RTI hardware
+      watchdogs stayed inactive; CONFIG_PANIC_TIMEOUT was 0.  The panic left
+      the board hung for over half an hour.  The same order was on the Debian
+      card (cam4), so an earlier belief that the RTI would recover cam4's hung
+      reboot was never true.
+
+  - id:       T1-WDOG-03
+    contract: |
+      The hardware watchdog actually resets the board.  A watchdog that is
+      armed and petted but whose expiry is not wired to a reset is decoration:
+      it is the only recovery for a hang that freezes every CPU at once, and
+      nothing else in the system can tell the difference until that day.
+    level:    must
+    peers:    console capture from the bench
+    setup: |
+      Booted board with the platform's hardware watchdog armed by the system
+      (Linux: systemd RuntimeWatchdogSec, identity of the petted device
+      recorded).  Disk synced.  Run last: deliberately destructive.
+    stimulus: |
+      Freeze EVERY CPU with interrupts off, so no software recovery can run --
+      Linux: modprobe test_lockup all_cpus=1 disable_irq=1 time_secs=600
+      (CONFIG_TEST_LOCKUP=m).  Not a panic: a panic's own reboot path would
+      mask a watchdog that cannot reset.
+    pass: |
+      The next first-stage boot banner appears within the armed timeout plus
+      30 s, with no hands, and the board returns to service.  Where the
+      platform reports a reset reason, it names the watchdog.
+    evidence: |
+      Console timestamps: the modprobe, the last kernel line, the next boot
+      banner; the armed timeout and the watchdog identity.
+    seen: |
+      Written 2026-09-14 before its first run.  Motivation: on TI K3 the RTI
+      expiry reaches the reset controller only through the ESM, which the
+      first-stage loader must program (U-Boot CONFIG_ESM_K3 + ti,esm-pins);
+      the BeagleY-AI image's RTI had never been armed at all until E2E run 1
+      removed softdog, so its reset path has never fired on this board.
+
+  - id:       T1-WDOG-04
+    contract: |
+      Every hang the kernel can see becomes a reboot, not a log line.  Lockup
+      and hung-task detectors that only warn leave the board up but useless,
+      and the hardware watchdog does not fire while one CPU still pets it.
+    level:    must
+    peers:    console capture from the bench
+    setup:    booted board, disk synced; one stimulus per boot
+    stimulus: |
+      One at a time (Linux, CONFIG_TEST_LOCKUP=m):
+        soft lockup, one CPU:  modprobe test_lockup time_secs=60 disable_preempt=1
+        hard lockup, one CPU:  modprobe test_lockup time_secs=60 disable_irq=1
+        task wedged in D:      modprobe test_lockup time_secs=600 state=D
+                               (runs past the hung-task timeout)
+        oops:                  a driver fault (Linux: echo c is a panic, not an
+                               oops -- use lkdtm EXCEPTION where built)
+    pass: |
+      Each ends in the detector's own panic message ("soft lockup", "hard
+      LOCKUP", "blocked for more than", "Oops") followed by an automatic
+      reboot within the platform's panic timeout, and the board returns to
+      service.  A detector message WITHOUT a reboot FAILS.
+    evidence: console from stimulus to next boot banner, per stimulus
+    seen: |
+      BeagleY-AI 6.12 image, 2026-09-14: all three detectors were built but set
+      to warn only (softlockup_panic, hardlockup detector off entirely,
+      hung_task_panic, panic_on_oops all 0).  Found by audit, not yet by a
+      hang in the field.

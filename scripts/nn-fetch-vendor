@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# nn-fetch-vendor — pull a versioned vendor-blob package out of the MinIO
+# artifact store and verify every file against the package manifest.
+#
+#   nn-fetch-vendor <package> <dest-dir>        e.g. nn-fetch-vendor cc33xx-1.0.2.10 /tmp/fw
+#
+# Layout in the bucket:  nn-images/vendor/<package>/{<files>, manifest.json}
+# manifest.json = {"vendor":..,"package":..,"files":[{"name","size","sha256"},..]}
+#
+# Why this exists: vendor blobs (TI cc33xx firmware pair + loader) are not in
+# git and must not be scraped from a URL that rots; the build script takes
+# NN_FW_DIR and refuses without it.  A Jenkins stage calls this first.
+# Exit 0 only when every file in the manifest is present with the right hash.
+set -euo pipefail
+PKG="${1:?usage: nn-fetch-vendor <package> <dest-dir>}"; DEST="${2:?dest dir}"
+ENVF="${NN_MINIO_ENV:-/media/chalos/mx500/nn-jenkins/minio.env}"
+# shellcheck disable=SC1090
+[ -f "$ENVF" ] && . "$ENVF"
+: "${NN_MINIO_ACCESS:?}" "${NN_MINIO_SECRET:?}"
+: "${NN_MINIO_ENDPOINT:=http://127.0.0.1:9000}" "${NN_MINIO_BUCKET:=nn-images}"
+STAGE_ROOT="${NN_MINIO_STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}"
+
+# The agent that runs these scripts has no python3 (nn-byai-image #1 died on
+# "python3: command not found"), so when the host lacks it, run python3 inside
+# the pinned nn-build:host-ci image with the same paths mounted at the same
+# places -- every path these scripts touch is under STAGE_ROOT or the cwd.
+# NN_TOOLS_IN_CONTAINER=1 forces the container even where the host has the tool, so a
+# local run and the agent run use the same interpreter (build #1 came from that divergence)
+if [ "${NN_TOOLS_IN_CONTAINER:-0}" = 1 ] || ! command -v python3 >/dev/null 2>&1; then
+    python3() {
+        docker run --rm -i --user "$(id -u):$(id -g)" -e HOME=/tmp/home \
+            -v "${STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}":"${STAGE_ROOT:-/media/chalos/mx500/nn-jenkins/tmp}" \
+            $([ "$PWD" != / ] && printf -- "-v %s:%s -w %s" "$PWD" "$PWD" "$PWD") ${NN_PY_EXTRA_MOUNTS:-} nn-build:host-ci python3 "$@"
+    }
+fi
+mkdir -p "$STAGE_ROOT" "$DEST"; W="$(mktemp -d -p "$STAGE_ROOT")"
+DEST="$(cd "$DEST" && pwd)"; export NN_PY_EXTRA_MOUNTS="-v $DEST:$DEST"
+trap 'rm -rf "$W"' EXIT
+docker run --rm --network host --entrypoint sh \
+    -e MC_HOST_nn="${NN_MINIO_ENDPOINT/:\/\//://$NN_MINIO_ACCESS:$NN_MINIO_SECRET@}" \
+    -v "$W":/w minio/mc:latest -c "mc cp --recursive nn/$NN_MINIO_BUCKET/vendor/$PKG/ /w/ >/dev/null"
+[ -f "$W/manifest.json" ] || { echo "nn-fetch-vendor: no manifest.json for vendor/$PKG" >&2; exit 3; }
+python3 - "$W" "$DEST" <<'PY'
+import json, sys, hashlib, os, shutil
+w, dest = sys.argv[1:3]
+m = json.load(open(os.path.join(w, "manifest.json")))
+bad = 0
+for f in m["files"]:
+    p = os.path.join(w, f["name"])
+    if not os.path.isfile(p):
+        print(f"  MISSING {f['name']}"); bad += 1; continue
+    h = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    if h != f["sha256"] or os.path.getsize(p) != f["size"]:
+        print(f"  BAD     {f['name']} (sha/size mismatch)"); bad += 1; continue
+    shutil.copy2(p, os.path.join(dest, f["name"])); print(f"  ok      {f['name']}  {f['size']} B  {h[:16]}…")
+print(f"nn-fetch-vendor: {m.get('package')} -> {dest}: {len(m['files'])-bad}/{len(m['files'])} verified")
+sys.exit(1 if bad else 0)
+PY

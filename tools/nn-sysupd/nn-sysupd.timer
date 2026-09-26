@@ -1,0 +1,12 @@
+[Unit]
+Description=nn whole-system A/B slot updater (90 s after boot, then every 10 min)
+
+[Timer]
+# 90 s: early enough that a pending trial slot is judged well before U-Boot's
+# third boot, late enough for the camera stack and Wi-Fi to be up
+OnBootSec=90
+OnUnitActiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

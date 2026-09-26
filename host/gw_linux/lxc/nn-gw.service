@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Systemd unit (inside the LXC container) that supervises gw_linux.
+# Restart=always is what turns the daemon's post-COMMIT _exit(0) into a
+# clean restart that picks up the just-persisted provisioning blob.
+
+[Unit]
+Description=nn gateway daemon (network provisioning)
+# With host networking (lxc.net.0.type = none) the container's
+# systemd-networkd-wait-online never fires.  Wait on the host's
+# network instead by triggering after multi-user is up.
+After=multi-user.target
+
+[Service]
+Type=simple
+# /usr/local/sbin/gw-supervise picks the right gw_linux subcommand:
+#   - operate          if gw_provision is complete (six files present)
+#   - provision-net    --no-mdns otherwise
+# Same loop handles both: the daemon's _exit(0) after COMMIT triggers a
+# restart through Restart=always, the supervisor sees the now-complete
+# blob, and switches into operate.
+ExecStart=/usr/local/sbin/gw-supervise
+Restart=always
+RestartSec=1
+# gw_linux pings the watchdog while its main loop runs; a frozen or hung
+# gateway is restarted (its NCP would otherwise keep routing the mesh's
+# uplink into a dead process).
+WatchdogSec=45
+NotifyAccess=main
+
+# Run as root inside the container — the kvstore lives under
+# /root/.local/state/nn-gw which is bind-mounted to /var/lib/nn-gw on
+# the host.  HOME must be set so the daemon's XDG_STATE_HOME fallback
+# resolves correctly.
+User=root
+Environment=HOME=/root
+# Gateway host profile (NCP_UART, NCP_UART_FLOW, NCP_UART_BAUD, …).
+# rpi5:       nothing needed (defaults: auto-discovery + rtscts@460800)
+# beagley-ai: NCP_UART=/dev/ttyAMA0, NCP_UART_FLOW=none
+EnvironmentFile=-/etc/nn-gw.env
+
+# Sensible cap drop while still letting us bind :8770 and talk to
+# avahi via D-Bus.
+NoNewPrivileges=true
+ProtectHome=false
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Apache-2.0
+menu "nn_audio (P4 AAC mic capture)"
+
+config NN_AUDIO_ENABLE
+    bool "Enable AAC audio capture (ES8311 I2S mic)"
+    default y
+    depends on NN_FEATURE_CAMERA
+    help
+      Capture mono PCM from the ES8311 codec over I2S, AAC-LC encode it, and
+      stream it to the C6 alongside video (each packet device-timestamped).
+
+choice NN_AUDIO_SOURCE
+    prompt "Audio source"
+    default NN_AUDIO_SOURCE_ES8311
+    depends on NN_AUDIO_ENABLE
+
+config NN_AUDIO_SOURCE_ES8311
+    bool "ES8311 I2S codec (real mic)"
+
+config NN_AUDIO_SOURCE_SYNTH
+    bool "Synthetic sine (no hardware, for testing the pipeline)"
+
+endchoice
+
+# ── ES8311 I2S + I2C pins (board: cdata=7 cclk=8 dsdin=9 lrck=10 asdout=11
+#    sclk=12 mclk=13).  DIN is the mic path (codec ASDOUT/GPIO11). ──────────
+config NN_AUDIO_I2S_MCLK_GPIO
+    int "I2S MCLK gpio (mclk)"
+    default 13
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_I2S_BCLK_GPIO
+    int "I2S BCLK gpio (sclk)"
+    default 12
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_I2S_WS_GPIO
+    int "I2S WS/LRCK gpio (lrck)"
+    default 10
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_I2S_DOUT_GPIO
+    int "I2S DOUT gpio -> codec dsdin (speaker path; -1 if unused)"
+    default 9
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_I2S_DIN_GPIO
+    int "I2S DIN gpio <- codec asdout (MIC path)"
+    default 11
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_I2C_SDA_GPIO
+    int "ES8311 I2C SDA gpio (cdata)"
+    default 7
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_I2C_SCL_GPIO
+    int "ES8311 I2C SCL gpio (cclk)"
+    default 8
+    depends on NN_AUDIO_ENABLE
+
+config NN_AUDIO_SAMPLE_RATE
+    int "Sample rate (Hz)"
+    default 16000
+    depends on NN_AUDIO_ENABLE
+config NN_AUDIO_AAC_BITRATE
+    int "AAC bitrate (bps)"
+    default 32000
+    depends on NN_AUDIO_ENABLE
+
+endmenu

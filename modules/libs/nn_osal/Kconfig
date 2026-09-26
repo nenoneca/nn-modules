@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig NN_OSAL
+	bool "nn project OS Abstraction Layer"
+	default y
+	help
+	  Library that wraps RTOS / platform services (threads, sync, time,
+	  GPIO, logging, storage, sockets, libc) behind a stable
+	  nn_osal_* API.  All nn libraries (node_mgr, fw_common, nn_proto)
+	  go through this instead of #include-ing <zephyr/...> directly.
+
+if NN_OSAL
+
+choice
+	prompt "nn_osal backend"
+	default NN_OSAL_BACKEND_ZEPHYR
+	help
+	  Which platform backend to compile.
+
+config NN_OSAL_BACKEND_ZEPHYR
+	bool "Zephyr RTOS"
+	help
+	  Forwards every OSAL call to the corresponding k_* / zsock_* /
+	  settings_* / flash_img_* API.  Default on Zephyr targets.
+
+endchoice
+
+config NN_OSAL_LOG_LEVEL
+	int "Default log level for nn_osal-using modules"
+	default 3
+	range 0 4
+	help
+	  0 = off, 1 = err, 2 = wrn, 3 = inf, 4 = dbg.  Per-module overrides
+	  still work via Zephyr's CONFIG_LOG_*_MODULE_LEVEL knobs.
+
+endif # NN_OSAL

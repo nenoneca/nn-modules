@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: Apache-2.0
+// Interface to the shared accelerator services (nn-inferd, nn-transcoded).
+//
+// Transport is protobuf over AF_UNIX SOCK_SEQPACKET (one message = one
+// datagram, so no length framing).  NOT gRPC: file-descriptor passing is
+// the whole point, and gRPC cannot do it.
+//
+// PIXELS NEVER TRAVEL OVER THE SOCKET.  A client creates a frame pool
+// (memfd or dma-buf), passes the fd ONCE with SCM_RIGHTS in OpenPool, and
+// thereafter every request just names {pool, slot} — see
+// nn-media-stream/docs/ACCEL_SERVICES_DESIGN.md.
+syntax = "proto3";
+package nn.accel.v1;
+
+// ── inventory ─────────────────────────────────────────────────────────────
+enum DeviceKind {
+  DEVICE_UNKNOWN = 0;
+  DEVICE_CPU     = 1;   // onnxruntime
+  DEVICE_AIPU    = 2;   // CIX Zhouyi (Orange Pi 6 Plus)
+  DEVICE_TIDL    = 3;   // TI C7x (BeagleY-AI)
+  DEVICE_EDGETPU = 4;   // Coral
+  DEVICE_HAILO   = 5;
+}
+
+message Device {
+  string     id          = 1;   // "aipu0", "c7x0", "coral0", ...
+  DeviceKind kind        = 2;
+  // Jobs this device sustains IN FLIGHT.  Total service concurrency is the
+  // sum over devices; workers pull from one queue so a fast device never
+  // idles behind a slow one.
+  uint32     parallelism = 3;
+  repeated string models = 4;   // preloaded model ids
+  bool       healthy     = 5;
+}
+
+message Capabilities {
+  string          service_version = 1;
+  repeated Device devices         = 2;
+  repeated PixelFormat formats    = 3;   // accepted pool formats
+  uint32          max_slot_bytes  = 4;
+}
+
+enum PixelFormat {
+  PIX_UNKNOWN = 0;
+  PIX_RGB888  = 1;
+  PIX_BGR888  = 2;
+  PIX_NV12    = 3;
+  PIX_H264    = 4;   // bitstream slots (transcode output)
+}
+
+// ── frame pools (zero copy) ───────────────────────────────────────────────
+message PoolSpec {
+  string      owner       = 1;   // camera id, for fair queueing + metrics
+  uint32      slots       = 2;
+  uint32      slot_bytes  = 3;
+  PixelFormat format      = 4;
+  uint32      width       = 5;
+  uint32      height      = 6;
+  uint32      stride      = 7;
+  // The pool fd rides with this message (SCM_RIGHTS).  dmabuf=true when it
+  // came from a DMA heap / V4L2 export, so the accelerator can read the
+  // very buffer the camera DMA'd into.
+  bool        dmabuf      = 8;
+}
+message PoolId { uint32 id = 1; }
+
+// ── inference ─────────────────────────────────────────────────────────────
+message InferReq {
+  uint32 pool     = 1;
+  uint32 slot     = 2;
+  uint64 seq      = 3;
+  uint64 ts_ms    = 4;   // capture time, echoed back
+  string model_id = 5;   // "" = the service default
+  // Deadline: drop rather than run late.  A detection that arrives after
+  // the frame is gone is worse than none — it moves a box onto stale video.
+  uint32 deadline_ms = 6;
+}
+
+message Detection {
+  uint32 x = 1; uint32 y = 2; uint32 w = 3; uint32 h = 4;
+  uint32 class_id   = 5;
+  uint32 conf_x1000 = 6;
+}
+
+message InferResp {
+  uint64 seq   = 1;
+  uint64 ts_ms = 2;
+  repeated Detection dets = 3;
+  string device_id   = 4;    // which accelerator ran it
+  uint32 latency_us  = 5;
+  uint32 queue_us    = 6;    // time spent waiting: the number to watch
+  bool   dropped     = 7;    // deadline missed / queue cap hit
+  bool   slot_released = 8;  // false => client must send Release
+}
+
+message Release { uint32 pool = 1; uint32 slot = 2; }
+
+// ── transcode ─────────────────────────────────────────────────────────────
+message EncodeReq {
+  uint32 pool  = 1;
+  uint32 slot  = 2;          // NV12 in
+  uint64 seq   = 3;
+  uint64 ts_ms = 4;
+  uint32 bitrate     = 5;
+  uint32 gop         = 6;
+  bool   force_idr   = 7;
+  uint32 out_pool    = 8;    // bitstream pool the service writes into
+}
+message EncodeResp {
+  uint64 seq = 1; uint64 ts_ms = 2;
+  uint32 out_pool = 3; uint32 out_slot = 4; uint32 bytes = 5;
+  bool   keyframe = 6;
+  string device_id = 7;
+  uint32 latency_us = 8;
+}
+
+// A LIVE transcode session: H.264 in, MPEG-TS out, both over loopback TCP.
+//
+// Deliberately NOT frame-RPC over the pool.  Decode and encode stay inside
+// this service, so raw frames (93 MB/s at 1080p30 NV12) never cross a
+// process boundary at all — strictly better than moving them zero-copy.
+// What crosses is the COMPRESSED stream, a few hundred KB/s, where the
+// copy is irrelevant and TCP's losslessness is worth more.
+message TranscodeOpen {
+  string owner    = 1;      // camera id, for stats and idempotent re-open
+  uint32 in_port  = 2;      // camera's tcpserversink (raw H.264, loopback)
+  uint32 bitrate  = 3;
+  uint32 gop      = 4;
+  uint32 qp       = 5;      // fixed QP; CIX P1 ignores bitrate (0 = unused)
+  bool   mux_ts   = 6;      // wrap output in MPEG-TS (keeps real PTS)
+}
+message TranscodeSession {
+  string owner    = 1;
+  uint32 out_port = 2;      // where the consumer reads the transcoded stream
+  bool   running  = 3;
+  string device_id= 4;
+  uint64 bytes_out= 5;
+  uint32 restarts = 6;      // codec wedges recovered without touching a camera
+  string error    = 7;
+}
+message TranscodeClose { string owner = 1; }
+
+// One compressed access unit is READY in the pool.  Carries no bytes: the
+// AU itself is already in shared memory, written once by the producer and
+// read in place by the service.  This datagram only says which slot.
+message TranscodeAu {
+  uint32 slot  = 1;
+  uint64 seq   = 2;
+  uint64 ts_ms = 3;
+  uint32 bytes = 4;         // AU length inside the slot
+  bool   keyframe = 5;
+}
+
+// ── envelope ──────────────────────────────────────────────────────────────
+// One datagram, one Msg.  Requests carry an id the reply echoes, so a
+// client can pipeline without blocking on each response.
+message Msg {
+  uint32 id = 1;
+  oneof body {
+    HelloReq     hello      = 2;
+    Capabilities caps       = 3;
+    PoolSpec     open_pool  = 4;
+    PoolId       pool_id    = 5;
+    InferReq     infer      = 6;
+    InferResp    infer_resp = 7;
+    EncodeReq    encode     = 8;
+    EncodeResp   encode_resp= 9;
+    Release      release    = 10;
+    Error        error      = 11;
+    TranscodeOpen    tc_open  = 12;
+    TranscodeSession tc_sess  = 13;
+    TranscodeClose   tc_close = 14;
+    TranscodeAu      tc_au    = 15;
+  }
+}
+message HelloReq { string client = 1; string version = 2; }
+message Error    { uint32 code = 1; string message = 2; }

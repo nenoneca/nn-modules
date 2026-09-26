@@ -1,0 +1,406 @@
+#!/bin/sh
+# nn-sysupd — whole-system A/B slot updater for the BeagleY Buildroot image.
+#
+# Layout "ab-v1" (design: byai System OTA, 2026-09-15): an MBR card with disk
+# signature 6e6e6279 and four primaries — -01 boot FAT (boot chain only),
+# -02 rootfs_a, -03 rootfs_b, -04 nn-data.  Each root slot carries its own
+# kernel, device trees and modules under /boot, so ONE artifact
+# (byai_system-<ver>.rootfs.ext4.xz) is one coherent system.  U-Boot picks
+# the slot from its environment (nn_slot / nn_slot_try) and falls back by
+# boot count (bootlimit=3, altbootcmd sets nn_rollback=1).
+#
+# One run = one step of the state machine (a systemd timer ticks every
+# 10 min, plus one run 90 s after boot):
+#   no pending : poll the hub target -> gate -> stream into the idle slot ->
+#                verify (digests, fsck, version file) -> arm (root= rewrite,
+#                machine-id copy, pending file, fw_setenv nn_slot_try) -> reboot
+#   pending    : health gate on the trial slot -> confirm (nn_slot=<try>) or
+#                blacklist + clear try + reboot back
+#   nn_rollback: U-Boot already fell back -> blacklist pending.version, clear
+# Everything is idempotent across a power cut: the trial slot is only armed
+# after the slot content has been verified on the card, and pending lives on
+# nn-data, which no slot swap touches.
+#
+# POSIX sh (busybox ash).  Tools: curl xz dd sha256sum e2fsck mount umount
+# blockdev fw_printenv fw_setenv systemctl (+ ionice/nice when present).
+# Every path/device is overridable through NN_* so the whole flow runs under
+# tests/run.sh against fakes on a dev host.
+set -u
+
+# ── configuration ────────────────────────────────────────────────────────────
+TYPE=byai_system
+LAYOUT_WANT=ab-v1
+SIG=${NN_DISK_SIG:-6e6e6279}
+BYUUID=${NN_BYUUID:-/dev/disk/by-partuuid}
+KV=${NN_KV:-/var/lib/nn/kv/nnprov}                 # nn_prov: name, hub_host, done
+STATE=${NN_SYSUPD_STATE:-/var/lib/nn-ota/sys}      # on nn-data: pending, blocked, dl/
+LAYOUT_FILE=${NN_LAYOUT_FILE:-/etc/nn-layout}
+SYSVER_FILE=${NN_SYSVER_FILE:-/etc/nn-system-version}
+BOOTCHAIN_FILE=${NN_BOOTCHAIN_FILE:-/boot-fat/nn-boot-chain}   # version of tiboot3/tispl/u-boot on the FAT
+MACHINE_ID=${NN_MACHINE_ID:-/etc/machine-id}
+FW_ENV_CONFIG=${NN_FW_ENV_CONFIG:-/etc/fw_env.config}
+CMDLINE=${NN_CMDLINE:-/proc/cmdline}
+UPTIME_FILE=${NN_UPTIME_FILE:-/proc/uptime}
+SYSBLOCK=${NN_SYSBLOCK:-/sys/class/block}
+RPROC_DIR=${NN_RPROC_DIR:-/sys/class/remoteproc}
+BT_ADDR_GLOB=${NN_BT_ADDR_GLOB:-/sys/class/bluetooth/hci*/address}
+MNT=${NN_MNT:-/run/nn-sysupd/slot}
+# The single-instance lock lives on tmpfs, NOT on nn-data: a crash mid-run
+# (the crash-during-write test, 2026-09-16) left a lock on the persistent
+# state dir that silently skipped every tick for 30 minutes after the reboot.
+LOCK=${NN_LOCK:-/run/nn-sysupd/lock}
+HEALTH_MIN_UPTIME=${NN_HEALTH_MIN_UPTIME:-60}      # s since boot before the trial slot may be judged
+# remoteprocs the IMAGE expects to run, one name per line (e.g. the camera
+# image lists 7e000000.dsp and 78400000.r5f; the bare image ships no file
+# because it carries no MCU/DSP firmware and every core is "offline").
+# A name matches remoteproc*/name (the DT node address, 7e000000.dsp) OR
+# remoteproc*/firmware (the DT firmware-name, j722s-c71_0-fw) -- the latter is
+# what an image ships and can reason about.  "running" and "attached" both count.
+EXPECT_RPROC=${NN_EXPECT_RPROC:-/etc/nn-sysupd/expect-remoteprocs}
+# CPUs the image expects online (a number).  A trial U-Boot once left the
+# A53 cluster single-core ("CPU1: failed to come online") and the slot still
+# confirmed (2026-09-16): a board that lost three cores is not healthy.
+EXPECT_CPUS=${NN_EXPECT_CPUS:-/etc/nn-sysupd/expect-cpus}
+SYSCPU=${NN_SYSCPU:-/sys/devices/system/cpu}
+HEALTH_HOOKS=${NN_HEALTH_HOOKS:-/etc/nn-sysupd/health.d}
+CAMERA_UNIT=${NN_CAMERA_UNIT:-nn-camera.service}
+CAMERA_MIN_ACTIVE=${NN_CAMERA_MIN_ACTIVE:-60}
+API_PORT=${NN_API_PORT:-8769}
+FW_PORT=${NN_FW_PORT:-8770}
+NO_REBOOT=${NN_NO_REBOOT:-0}
+
+log() { echo "[nn-sysupd] $*"; }
+die() { log "ERROR: $*"; exit 1; }
+
+mkdir -p "$STATE/dl" "$MNT" "$(dirname "$LOCK")" 2>/dev/null || true
+rmdir "$STATE/lock" 2>/dev/null || true          # pre-fix agents left it on nn-data
+
+# ── single instance ──────────────────────────────────────────────────────────
+# mkdir is the atomic test-and-set; the holder's pid inside lets a later run
+# tell a live writer (leave it alone) from a dead one (take over).
+if ! mkdir "$LOCK" 2>/dev/null; then
+    holder=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$holder" ] && [ -d "/proc/$holder" ]; then
+        log "another run (pid $holder) holds the lock — skipping this tick"
+        exit 0
+    fi
+    log "stale lock (pid ${holder:-?} gone) — taking over"
+    rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 0
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
+# ── small helpers ────────────────────────────────────────────────────────────
+kv_get() { cat "$KV/$1" 2>/dev/null; }
+provisioned() { [ "$(od -An -tu1 -N1 "$KV/done" 2>/dev/null | tr -d ' ')" = 1 ]; }
+
+# first "key": "value" or "key": 123 in a JSON blob (flat search; the hub
+# emits compact single-line JSON and the keys we read are unique per doc)
+json_get() {  # json_get <key> < json
+    sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -1
+}
+
+slot_dev() { case "$1" in a) echo "$BYUUID/$SIG-02";; b) echo "$BYUUID/$SIG-03";; esac; }
+slot_uuid() { case "$1" in a) echo "$SIG-02";; b) echo "$SIG-03";; esac; }
+other_slot() { case "$1" in a) echo b;; b) echo a;; esac; }
+
+booted_slot() {
+    # root=PARTUUID=6e6e6279-02 -> a, -03 -> b; anything else is not ab-v1
+    local u; u=$(tr ' ' '\n' < "$CMDLINE" | sed -n 's/^root=PARTUUID=//p' | head -1)
+    case "$u" in "$SIG-02") echo a;; "$SIG-03") echo b;; *) echo "";; esac
+}
+
+# The disk a partition device sits on, via sysfs (mmcblk1p2 -> mmcblk1).
+disk_of() {
+    local real name parent
+    real=$(readlink -f "$1") || return 1
+    name=$(basename "$real")
+    parent=$(basename "$(dirname "$(readlink -f "$SYSBLOCK/$name")")")
+    echo "/dev/$parent"
+}
+
+# fw_env.config must point at the disk that holds the booted root.  Block
+# numbering is not something to bet a boot on: writing environment bytes into
+# the wrong disk would be silent until the next power cycle.
+check_env_device() {
+    local envdev rootdisk
+    envdev=$(grep -v '^[[:space:]]*#' "$FW_ENV_CONFIG" 2>/dev/null | awk 'NF{print $1; exit}')
+    [ -n "$envdev" ] || die "no device in $FW_ENV_CONFIG"
+    rootdisk=$(disk_of "$(slot_dev "$BOOTED")") || die "cannot resolve the disk of the booted root"
+    [ "$(readlink -f "$envdev")" = "$(readlink -f "$rootdisk")" ] || \
+        die "$FW_ENV_CONFIG names $envdev but the booted root is on $rootdisk — refusing to touch the environment"
+}
+
+env_get() { fw_printenv -n "$1" 2>/dev/null; }
+env_set() {  # env_set name=value ... (one fw_setenv call; empty value deletes)
+    local f="$STATE/env.$$" kv
+    : > "$f"
+    for kv in "$@"; do
+        printf '%s %s\n' "${kv%%=*}" "${kv#*=}" >> "$f"
+    done
+    fw_setenv -s "$f" || { rm -f "$f"; die "fw_setenv failed"; }
+    rm -f "$f"
+}
+
+# ── hub ──────────────────────────────────────────────────────────────────────
+HUB=$(kv_get hub_host)
+API="http://$HUB:$API_PORT/api/v1"
+FW="http://$HUB:$FW_PORT/gw_firmware"
+
+# The board's BLE address, i.e. the identity the hub bound to the slot at
+# provisioning.  Sources, first hit wins, result cached on nn-data so a late
+# hci0 (it appears well after the 90 s boot tick on the cc33xx) or a powered-
+# off adapter never costs a report again:
+#   1. $KV/ble_addr        written by the provisioning daemon (when present)
+#   2. sysfs hci*/address  kernels that expose it (6.12 with cc33xx does NOT)
+#   3. hciconfig hci0      "BD Address: XX:XX:.." — works powered-off, no bluetoothd,
+#                          exits at once without a tty (BLUEZ5_UTILS_DEPRECATED)
+#   4. the cache from an earlier run
+# NOT btmgmt: without a tty it either exits before the mgmt reply (no output)
+# or, with stdout in a pipe, never exits — it hung this service for 3 minutes
+# on the board (2026-09-16).  There is no timeout(1) in the image either.
+_addr_ok() { case "$1" in ??:??:??:??:??:??) case "$1" in 00:00:00:00:00:00) return 1;; esac; return 0;; *) return 1;; esac; }
+bt_addr() {
+    local f a
+    a=$(kv_get ble_addr | tr 'a-f' 'A-F' | tr -d ' \n')
+    _addr_ok "$a" || { a=""; for f in $BT_ADDR_GLOB; do a=$(cat "$f" 2>/dev/null); _addr_ok "$a" && break; a=""; done; }
+    _addr_ok "$a" || a=$(hciconfig hci0 </dev/null 2>/dev/null | sed -n 's/.*BD Address: \([0-9A-Fa-f:]\{17\}\).*/\1/p' | head -1)
+    _addr_ok "$a" || a=$(cat "$STATE/ble_addr" 2>/dev/null)
+    _addr_ok "$a" || return 1
+    a=$(echo "$a" | tr 'a-f' 'A-F')
+    [ "$(cat "$STATE/ble_addr" 2>/dev/null)" = "$a" ] || echo "$a" > "$STATE/ble_addr"
+    echo "$a"
+}
+
+# The board does not know its slot id (hub-side plumbing); it knows its BLE
+# address, which the hub bound to the slot at provisioning.
+report() {  # report <state-word>
+    local addr; addr=$(bt_addr) || { log "report skipped: no BLE address yet (KV/sysfs/hciconfig/cache all empty) — will retry next tick"; return 0; }
+    curl -sf -m 8 -X PUT "$API/cameras/by-addr/$addr/bundle" \
+        -H "Content-Type: application/json" \
+        -d "{\"version\":\"-\",\"device_type\":\"$TYPE\",\"system\":\"$CUR\",\"layout\":\"$LAYOUT\",\"slot\":\"$BOOTED\",\"sysupd\":\"$1\"}" \
+        >/dev/null 2>&1 || log "report to hub failed ($1)"
+}
+
+hub_target() {
+    curl -sf -m 15 "$API/firmware" 2>/dev/null | tr '{' '\n' | grep "\"$TYPE\"" | json_get target_version
+}
+
+blocked() { grep -qx "$1" "$STATE/blocked" 2>/dev/null; }
+block() { echo "$1" >> "$STATE/blocked"; }
+
+# ── version compare (a >= b) ─────────────────────────────────────────────────
+ver_ge() {
+    [ "$1" = "$2" ] && return 0
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -1)" = "$1" ]
+}
+
+# ── health of the trial slot ─────────────────────────────────────────────────
+healthy() {
+    local up n d st h
+    up=$(cut -d. -f1 "$UPTIME_FILE" 2>/dev/null)
+    [ "${up:-0}" -ge "$HEALTH_MIN_UPTIME" ] || { log "health: uptime ${up:-?}s < $HEALTH_MIN_UPTIME"; return 2; }
+    provisioned || { log "health: provisioning state missing after swap"; return 1; }
+    # any remoteproc in "crashed" is a fault whatever the image expects
+    for d in "$RPROC_DIR"/remoteproc*; do
+        [ -e "$d/state" ] || continue
+        [ "$(cat "$d/state" 2>/dev/null)" = crashed ] && { log "health: $(cat "$d/name" 2>/dev/null || basename "$d") crashed"; return 1; }
+    done
+    # the ones the image says must run
+    if [ -s "$EXPECT_RPROC" ]; then
+        while read -r want; do
+            case "$want" in ""|\#*) continue;; esac
+            st=""
+            for d in "$RPROC_DIR"/remoteproc*; do
+                # Accept either identifier.  name/ is the DT node address
+                # (7e000000.dsp) -- stable, but it says nothing about which
+                # core it is; firmware/ is the DT's firmware-name
+                # (j722s-c71_0-fw), which is what an image actually ships and
+                # can check.  Matching only on name/ meant an expectations
+                # file written in the obvious terms silently matched nothing
+                # and the core read as "absent".
+                if [ "$(cat "$d/name" 2>/dev/null)" = "$want" ] \
+                   || [ "$(cat "$d/firmware" 2>/dev/null)" = "$want" ]; then
+                    st=$(cat "$d/state" 2>/dev/null); break
+                fi
+            done
+            # "attached" = a core the boot chain started and Linux attached to
+            # (the DM R5 on the J722S): alive, just not booted by Linux
+            case "$st" in running|attached) ;; *) log "health: remoteproc $want is '${st:-absent}', expected running"; return 1;; esac
+        done < "$EXPECT_RPROC"
+    fi
+    if [ -s "$EXPECT_CPUS" ]; then
+        local want_cpus n_cpus c
+        want_cpus=$(tr -dc '0-9' < "$EXPECT_CPUS"); n_cpus=0
+        for c in "$SYSCPU"/cpu[0-9]*; do
+            [ -d "$c" ] || continue
+            # cpu0 has no 'online' file on most SoCs: present means online
+            if [ -f "$c/online" ]; then [ "$(cat "$c/online" 2>/dev/null)" = 1 ] && n_cpus=$((n_cpus+1)); else n_cpus=$((n_cpus+1)); fi
+        done
+        [ "$n_cpus" -ge "${want_cpus:-0}" ] || { log "health: $n_cpus CPUs online, image expects $want_cpus"; return 1; }
+    fi
+    # Hub unreachable is NOT YET DECIDABLE, not a fault.
+    #
+    # A camera is a Wi-Fi device that roams: this board moves between two APs,
+    # and a roam lasts longer than one 8 s curl.  Treating a single missed poll
+    # as "the image is bad" threw away a perfectly good update on 2026-09-16 --
+    # the trial had associated at 14 s and was downloading 12 MB happily at the
+    # time, but the one probe at 95 s landed in a gap, so the slot rolled back
+    # AND the version was blacklisted.
+    #
+    # Retrying is safe because the real failures are already bounded elsewhere:
+    # an image that never reaches the hub is rolled back by nn-trial-guard at
+    # the 20-minute deadline, and one that does not boot at all by U-Boot's
+    # bootcount.  This check exists to catch a hub that a NEW image cannot talk
+    # to, and that condition is still caught -- just by the deadline rather
+    # than by the first probe.
+    curl -sf -m 8 "$API/camera-slots" >/dev/null 2>&1 \
+        || { log "health: hub unreachable (transient? retrying -- nn-trial-guard bounds this)"; return 2; }
+    # An image may SHIP the camera unit while the app it runs lives on nn-data
+    # and is installed separately; the unit is then skipped by its own
+    # ConditionPathExists.  Skipped is not broken: judging it would roll back
+    # every board that takes such an image before its app is installed.
+    if systemctl is-enabled --quiet "$CAMERA_UNIT" 2>/dev/null \
+       && [ "$(systemctl show -p ConditionResult --value "$CAMERA_UNIT" 2>/dev/null)" = no ]; then
+        log "health: $CAMERA_UNIT skipped by its own condition (no app installed) — not judged"
+    elif systemctl is-enabled --quiet "$CAMERA_UNIT" 2>/dev/null; then
+        systemctl is-active --quiet "$CAMERA_UNIT" || { log "health: $CAMERA_UNIT not active"; return 1; }
+        local mono act
+        mono=$(cut -d' ' -f1 "$UPTIME_FILE" | cut -d. -f1)
+        act=$(systemctl show -p ActiveEnterTimestampMonotonic --value "$CAMERA_UNIT" 2>/dev/null)
+        act=$(( ${act:-0} / 1000000 ))
+        [ $((mono - act)) -ge "$CAMERA_MIN_ACTIVE" ] || { log "health: $CAMERA_UNIT active only $((mono - act))s"; return 2; }
+    fi
+    if [ -d "$HEALTH_HOOKS" ]; then
+        for h in "$HEALTH_HOOKS"/*; do
+            [ -x "$h" ] || continue
+            "$h" || { log "health: hook $(basename "$h") failed"; return 1; }
+        done
+    fi
+    return 0
+}
+
+do_reboot() {
+    if [ "$NO_REBOOT" = 1 ]; then log "reboot suppressed (NN_NO_REBOOT=1)"; return 0; fi
+    sync; systemctl reboot
+}
+
+# ── pending file (on nn-data) ────────────────────────────────────────────────
+pend_get() { sed -n "s/^$1=//p" "$STATE/pending" 2>/dev/null | head -1; }
+
+# ── preconditions ────────────────────────────────────────────────────────────
+LAYOUT=$(cat "$LAYOUT_FILE" 2>/dev/null)
+[ "$LAYOUT" = "$LAYOUT_WANT" ] || { log "layout '${LAYOUT:-none}' is not $LAYOUT_WANT — nothing to do"; exit 0; }
+provisioned || { log "not provisioned — idle"; exit 0; }
+[ -n "$HUB" ] || { log "no hub_host in $KV — idle"; exit 0; }
+CUR=$(cat "$SYSVER_FILE" 2>/dev/null)
+BOOTED=$(booted_slot)
+[ -n "$BOOTED" ] || die "booted root is not an ab-v1 slot (root= in $CMDLINE)"
+check_env_device
+
+# ── 1. U-Boot already fell back ──────────────────────────────────────────────
+if [ "$(env_get nn_rollback)" = 1 ]; then
+    bad=$(pend_get version)
+    log "U-Boot fell back to slot $BOOTED (boot count); ${bad:-unknown version} never reached the health gate"
+    [ -n "$bad" ] && block "$bad"
+    env_set nn_rollback= nn_slot_try= upgrade_available=0 bootcount=0
+    rm -f "$STATE/pending"
+    report rolled-back
+    exit 0
+fi
+
+# ── 2. a trial slot is pending judgement ─────────────────────────────────────
+if [ -f "$STATE/pending" ]; then
+    want=$(pend_get to_slot); ver=$(pend_get version); from=$(pend_get from_slot)
+    if [ "$BOOTED" != "$want" ]; then
+        log "pending $ver expected slot $want but booted $BOOTED — treating as failed"
+        block "$ver"; env_set nn_slot_try= upgrade_available=0 bootcount=0
+        rm -f "$STATE/pending"; report rolled-back; exit 0
+    fi
+    healthy; rc=$?
+    if [ $rc -eq 2 ]; then log "health: not yet decidable, will retry"; exit 0; fi
+    if [ $rc -eq 0 ]; then
+        env_set nn_slot="$BOOTED" nn_slot_try= upgrade_available=0 bootcount=0
+        rm -f "$STATE/pending"; echo "$ver" > "$STATE/confirmed"
+        log "CONFIRMED $ver on slot $BOOTED (was slot $from)"
+        report confirmed
+    else
+        log "health FAILED on $ver (slot $BOOTED) — rolling back to slot $from"
+        block "$ver"; env_set nn_slot_try= upgrade_available=0 bootcount=0
+        rm -f "$STATE/pending"; report rolled-back
+        do_reboot
+    fi
+    exit 0
+fi
+
+# ── 3. steady state: is there a newer system? ────────────────────────────────
+report idle
+TARGET=$(hub_target)
+[ -n "$TARGET" ] || { log "no $TYPE target on the hub"; exit 0; }
+[ "$TARGET" != "$CUR" ] || exit 0
+blocked "$TARGET" && { log "target $TARGET previously failed health — skipping"; exit 0; }
+
+META=$(curl -sf -m 15 "$FW/$TYPE/$TARGET/meta") || { log "meta for $TARGET unavailable"; exit 0; }
+fmt=$(echo "$META" | json_get format)
+sha=$(echo "$META" | json_get sha256)
+size=$(echo "$META" | json_get size)
+raw_sha=$(echo "$META" | json_get raw_sha256)
+raw_size=$(echo "$META" | json_get raw_size_bytes)
+req_layout=$(echo "$META" | json_get layout)
+req_boot=$(echo "$META" | json_get boot_chain_min)
+
+[ "$fmt" = "rootfs.ext4.xz" ] || { log "target $TARGET has format '${fmt:-none}', not rootfs.ext4.xz — skipping"; exit 0; }
+[ -n "$raw_sha" ] && [ -n "$raw_size" ] || { log "target $TARGET manifest lacks raw_sha256/raw_size_bytes — refusing"; exit 0; }
+[ "$req_layout" = "$LAYOUT" ] || { log "target $TARGET requires layout '${req_layout:-none}', board is $LAYOUT — refusing"; exit 0; }
+if [ -n "$req_boot" ]; then
+    have_boot=$(cat "$BOOTCHAIN_FILE" 2>/dev/null)
+    [ -n "$have_boot" ] || { log "target $TARGET requires boot chain >= $req_boot but $BOOTCHAIN_FILE is missing — refusing"; exit 0; }
+    ver_ge "$have_boot" "$req_boot" || { log "target $TARGET requires boot chain >= $req_boot, board has $have_boot — refusing"; exit 0; }
+fi
+
+IDLE=$(other_slot "$BOOTED"); DEV=$(slot_dev "$IDLE")
+[ -e "$DEV" ] || die "idle slot device $DEV missing"
+slot_bytes=$(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0)
+[ "$raw_size" -le "${slot_bytes:-0}" ] || { log "target $TARGET is $raw_size B, slot $IDLE is $slot_bytes B — refusing"; exit 0; }
+
+# ── 4. download (resumable), verify the compressed stream ────────────────────
+NICE=""; command -v ionice >/dev/null 2>&1 && NICE="ionice -c3"; command -v nice >/dev/null 2>&1 && NICE="$NICE nice -n 19"
+DL="$STATE/dl/$TYPE-$TARGET.xz"
+find "$STATE/dl" -type f ! -name "$(basename "$DL")" -delete 2>/dev/null
+log "downloading $TYPE $TARGET ($size B) into $DL"
+$NICE curl -sf -m 3600 -C - -o "$DL" "$FW/$TYPE/$TARGET" || { log "download failed (will resume next tick)"; exit 0; }
+got=$(sha256sum "$DL" | cut -d' ' -f1)
+[ "$got" = "$sha" ] || { log "download digest mismatch (got $got) — discarding"; rm -f "$DL"; exit 0; }
+xz -t "$DL" 2>/dev/null || { log "download is not a valid xz stream — discarding"; rm -f "$DL"; exit 0; }
+
+# ── 5. write the idle slot, then read it back ────────────────────────────────
+log "writing slot $IDLE ($DEV)"
+$NICE sh -c "xz -dc '$DL' | dd of='$DEV' bs=4M conv=fsync 2>/dev/null" || { log "write to $DEV failed"; exit 0; }
+sync
+have=$(head -c "$raw_size" "$DEV" | sha256sum | cut -d' ' -f1)
+[ "$have" = "$raw_sha" ] || { log "slot $IDLE read-back digest mismatch (got $have) — slot left unarmed"; exit 0; }
+e2fsck -fn "$DEV" >/dev/null 2>&1 || { log "e2fsck rejects slot $IDLE — slot left unarmed"; exit 0; }
+
+# ── 6. inspect + arm the slot ────────────────────────────────────────────────
+mount "$DEV" "$MNT" || { log "cannot mount slot $IDLE"; exit 0; }
+ok=1
+in_ver=$(cat "$MNT/etc/nn-system-version" 2>/dev/null)
+[ "$in_ver" = "$TARGET" ] || { log "slot says version '${in_ver:-none}', expected $TARGET"; ok=0; }
+[ -f "$MNT/boot/Image" ] || { log "slot has no /boot/Image"; ok=0; }
+[ -f "$MNT/boot/extlinux/extlinux.conf" ] || { log "slot has no extlinux.conf"; ok=0; }
+if [ $ok = 1 ]; then
+    sed -i "s|root=PARTUUID=[^ ]*|root=PARTUUID=$(slot_uuid "$IDLE")|" "$MNT/boot/extlinux/extlinux.conf"
+    grep -q "root=PARTUUID=$(slot_uuid "$IDLE")" "$MNT/boot/extlinux/extlinux.conf" || { log "root= rewrite failed"; ok=0; }
+    [ -s "$MACHINE_ID" ] && cp "$MACHINE_ID" "$MNT/etc/machine-id"
+fi
+umount "$MNT"; sync
+[ $ok = 1 ] || exit 0
+
+printf 'version=%s\nfrom_slot=%s\nto_slot=%s\n' "$TARGET" "$BOOTED" "$IDLE" > "$STATE/pending"
+sync
+env_set nn_slot_try="$IDLE" upgrade_available=1 bootcount=0
+rm -f "$DL"
+log "ARMED $TARGET in slot $IDLE — rebooting to try it (U-Boot falls back after 3 failed boots)"
+report armed
+do_reboot
+exit 0

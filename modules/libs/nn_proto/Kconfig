@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config NN_PROTO
+	bool "nn_proto wire-format library"
+	default y
+	help
+	  Pure encode/parse + signature-callback interface for the
+	  hub ↔ gateway ↔ device wire protocol (see docs/protocol/nn_proto.md).
+	  No crypto dependency on its own.
+
+# PSA bindings for the Ed25519 keystore that callers (gateway broker
+# `gw_identity.c`, future device-side equivalent) plug into nn_proto.
+# PSA_WANT_* symbols are invisible when MBEDTLS_PROMPTLESS=y and cannot
+# be set from prj.conf; they must be 'select'ed from an enabled symbol.
+config NN_PROTO_KEYSTORE_DEPS
+	bool "Pull in PSA ECDSA P-256 + SHA-256 deps for nn_proto keystores"
+	default y if NN_PROTO
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_BASIC
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_IMPORT
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_EXPORT
+	select PSA_WANT_KEY_TYPE_ECC_KEY_PAIR_GENERATE
+	select PSA_WANT_KEY_TYPE_ECC_PUBLIC_KEY
+	select PSA_WANT_ECC_SECP_R1_256
+	select PSA_WANT_ALG_ECDSA
+	# Deterministic ECDSA per RFC 6979 — derives the nonce from the
+	# message + private key so the embedded sign path doesn't need a
+	# per-signature RNG (avoids the classic ECDSA-on-embedded footgun
+	# where weak/biased k leaks the priv).
+	select PSA_WANT_ALG_DETERMINISTIC_ECDSA
+	select PSA_WANT_ALG_SHA_256

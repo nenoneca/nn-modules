@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config NN_PROTO_IDENTITY
+	bool "nn_proto P-256 identity primitives"
+	default y
+	help
+	  Storage-agnostic ECDSA P-256 keypair / SHA-256 helpers used by
+	  the gateway broker (gw_identity.c) and end-device clients
+	  (nn_proto_client.c) to derive an 8-byte node_id and sign /
+	  verify nn_proto frames.  Pulls in the same PSA selectors as
+	  nn_proto's NN_PROTO_KEYSTORE_DEPS.
